@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lesvi"
+description = "Single-port local library for agent-generated lessons and reference notes"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Ashish Pothal", email = "ashishpothal@gmail.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dynamic = ["version"]
+
+[project.scripts]
+lesvi = "lesvi.cli:main"
+
+[project.urls]
+Repository = "https://github.com/arthishaxom/lesvi"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.hatch.version]
+path = "src/lesvi/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [".agents", "AGENTS.md", "skills-lock.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
