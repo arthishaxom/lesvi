@@ -6,7 +6,7 @@
 
 ## Context
 
-`allow_localhost = true` (SPEC §12) skips auth for loopback clients so local browsing is frictionless. But `cloudflared` runs on the same machine and forwards tunneled requests to the origin over loopback, so a peer-IP-only rule would exempt every request — local browser and public internet alike. The token fallback would gate nothing, contradicting ADR-0004's consequence that "if Access is ever disabled or the tunnel URL leaks, the app token still gates access."
+`allow_localhost = true` (spec #1 §12) skips auth for loopback clients so local browsing is frictionless. But `cloudflared` runs on the same machine and forwards tunneled requests to the origin over loopback, so a peer-IP-only rule would exempt every request — local browser and public internet alike. The token fallback would gate nothing, contradicting ADR-0004's consequence that "if Access is ever disabled or the tunnel URL leaks, the app token still gates access."
 
 Cloudflare adds `CF-Connecting-IP` and `X-Forwarded-For` to all proxied traffic ([Cloudflare HTTP headers](https://developers.cloudflare.com/fundamentals/reference/http-request-headers/)). A request reaching the loopback-bound origin without those headers can only have come from a process already running on the machine — a trust boundary lesvi does not need to defend, since such a process can read shelf files directly.
 

@@ -2,7 +2,7 @@
 
 `lesvi` (lessons view) is a single-port, always-on local server that turns agent-generated lessons and reference notes into a browsable, mobile-first library reachable through one Cloudflare tunnel hostname. Point it at folders — **shelves** — and it indexes what is already there, serves the originals untouched, and renders virtual dashboard pages. Nothing is ever written into your content folders.
 
-Status: v1 approved (see [SPEC.md](SPEC.md)), not yet implemented.
+Status: v1 approved — spec is [issue #1](https://github.com/arthishaxom/lesvi/issues/1); not yet implemented.
 
 ## Glossary
 
@@ -43,7 +43,7 @@ Status: v1 approved (see [SPEC.md](SPEC.md)), not yet implemented.
 
 ## Links
 
-- [SPEC.md](SPEC.md) — v1 specification.
+- [Spec: lesvi v1](https://github.com/arthishaxom/lesvi/issues/1) — v1 specification (GitHub issue).
 - [docs/adr/](docs/adr/) — decision records.
 - [docs/research/existing-tools.md](docs/research/existing-tools.md) — 2026-09-15 survey of prior art.
 - [docs/cloudflare-setup.md](docs/cloudflare-setup.md) — tunnel + Access click-through.
