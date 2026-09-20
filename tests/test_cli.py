@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -22,24 +24,28 @@ from typing import IO, Any
 import pytest
 
 import lesvi
-from lesvi.cli import main
+from lesvi.cli import log_level, main
 
 
 def _run_cli(
-    *args: str, config: Path, cwd: Path | None = None
+    *args: str,
+    config: Path,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``python -m lesvi`` against an isolated ``LESVI_CONFIG``."""
-    env = {
+    environment = {
         **os.environ,
         "LESVI_CONFIG": str(config),
         "LESVI_STATE": str(config.parent / "state.json"),
+        **(env or {}),
     }
     return subprocess.run(
         [sys.executable, "-m", "lesvi", *args],
         capture_output=True,
         text=True,
         check=False,
-        env=env,
+        env=environment,
         cwd=cwd,
     )
 
@@ -745,6 +751,200 @@ def test_serve_no_watch_keeps_serving_the_startup_index(tmp_path: Path) -> None:
 
     assert payload["shelves"]["data-engg"]["total"] == 1
     assert payload["artifacts"][0]["path"] == "lessons/0001-intro.html"
+
+
+# --- ops: port conflicts, verbosity, status, service (issue #12) --------------
+
+
+def test_serve_port_in_use_names_the_port_and_hints_at_ss(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        code = main(
+            [
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--config",
+                str(tmp_path / "config.toml"),
+            ]
+        )
+    finally:
+        blocker.close()
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert f"port {port}" in captured.err
+    assert "ss -tlnp" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_log_level_rises_with_verbosity() -> None:
+    assert log_level(0) == logging.WARNING
+    assert log_level(1) == logging.INFO
+    assert log_level(2) == logging.DEBUG
+
+
+def test_serve_verbose_logs_requests_to_stderr(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    config.write_text(f'[shelves.data-engg]\npath = "{shelf}"\n')
+
+    process, _lines, local_url = _start_serve(tmp_path, config, None, "--verbose")
+    try:
+        urllib.request.urlopen(f"{local_url}/", timeout=5).read()
+    finally:
+        process.terminate()
+        _stdout, stderr = process.communicate(timeout=10)
+
+    assert "INFO" in stderr
+    assert "GET /" in stderr
+
+
+def test_status_reports_shelves_artifacts_and_the_service_state(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    reference = shelf / "reference"
+    reference.mkdir()
+    (reference / "cheatsheet.html").write_text("<html></html>")
+    _run_cli("add", str(shelf), config=config)
+    xdg = tmp_path / "xdg"
+    unit = xdg / "systemd" / "user" / "lesvi.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n")
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text("#!/bin/sh\necho active\n")
+    systemctl.chmod(0o755)
+
+    result = _run_cli(
+        "status",
+        config=config,
+        env={"XDG_CONFIG_HOME": str(xdg), "LESVI_SYSTEMCTL": str(systemctl)},
+    )
+
+    assert result.returncode == 0
+    assert "shelves:   1" in result.stdout
+    assert "artifacts: 2" in result.stdout
+    assert "service:   active" in result.stdout
+    assert "data-engg" in result.stdout
+    assert "lessons 1" in result.stdout
+
+
+def test_status_reports_an_uninstalled_service_without_shelves(
+    tmp_path: Path,
+) -> None:
+    result = _run_cli(
+        "status",
+        config=tmp_path / "config.toml",
+        env={
+            "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+            "LESVI_SYSTEMCTL": "",
+        },
+    )
+
+    assert result.returncode == 0
+    assert "shelves:   0" in result.stdout
+    assert "artifacts: 0" in result.stdout
+    assert "not installed" in result.stdout
+
+
+def test_service_install_writes_the_unit_and_prints_next_steps(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    xdg = tmp_path / "xdg"
+
+    result = _run_cli(
+        "service",
+        "install",
+        "--config",
+        str(config),
+        config=config,
+        env={"XDG_CONFIG_HOME": str(xdg), "LESVI_SYSTEMCTL": ""},
+    )
+
+    unit = xdg / "systemd" / "user" / "lesvi.service"
+    assert result.returncode == 0
+    assert unit.is_file()
+    text = unit.read_text()
+    assert "ExecStart=" in text
+    assert str(config) in text
+    assert "Restart=on-failure" in text
+    assert "systemctl --user enable --now lesvi" in result.stdout
+    assert "loginctl enable-linger $USER" in result.stdout
+
+
+def test_service_uninstall_removes_the_unit(tmp_path: Path) -> None:
+    xdg = tmp_path / "xdg"
+    unit = xdg / "systemd" / "user" / "lesvi.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n")
+
+    result = _run_cli(
+        "service",
+        "uninstall",
+        config=tmp_path / "config.toml",
+        env={"XDG_CONFIG_HOME": str(xdg), "LESVI_SYSTEMCTL": ""},
+    )
+
+    assert result.returncode == 0
+    assert not unit.exists()
+    assert "Removed" in result.stdout
+
+
+def test_service_uninstall_without_a_unit_is_an_error(tmp_path: Path) -> None:
+    result = _run_cli(
+        "service",
+        "uninstall",
+        config=tmp_path / "config.toml",
+        env={"XDG_CONFIG_HOME": str(tmp_path / "xdg"), "LESVI_SYSTEMCTL": ""},
+    )
+
+    assert result.returncode == 1
+    assert "no service unit" in result.stderr
+
+
+def test_service_status_reports_not_installed(tmp_path: Path) -> None:
+    result = _run_cli(
+        "service",
+        "status",
+        config=tmp_path / "config.toml",
+        env={"XDG_CONFIG_HOME": str(tmp_path / "xdg"), "LESVI_SYSTEMCTL": ""},
+    )
+
+    assert result.returncode == 0
+    assert "not installed" in result.stdout
+
+
+def test_service_status_reports_the_systemd_state(tmp_path: Path) -> None:
+    xdg = tmp_path / "xdg"
+    unit = xdg / "systemd" / "user" / "lesvi.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n")
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text("#!/bin/sh\necho inactive\n")
+    systemctl.chmod(0o755)
+
+    result = _run_cli(
+        "service",
+        "status",
+        config=tmp_path / "config.toml",
+        env={"XDG_CONFIG_HOME": str(xdg), "LESVI_SYSTEMCTL": str(systemctl)},
+    )
+
+    assert result.returncode == 0
+    assert "state: inactive" in result.stdout
 
 
 def test_serve_honours_watch_false_in_the_config(tmp_path: Path) -> None:

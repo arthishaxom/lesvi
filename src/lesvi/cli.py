@@ -1,20 +1,21 @@
 """Command-line surface for lesvi.
 
-``version``, ``add``, ``list``, ``remove`` and ``serve`` exist so far; the
-remaining commands from the spec (``url``, ``status``, ``service``) land with
-their feature tickets.
+``version``, ``add``, ``list``, ``remove``, ``serve``, ``status`` and
+``service`` exist so far; ``url`` remains and lands with its feature ticket.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import logging
 import math
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from lesvi import __version__
+from lesvi import __version__, service
 from lesvi.config import (
     Config,
     ConfigError,
@@ -32,6 +33,28 @@ from lesvi.state import PinState
 from lesvi.watch import Watcher
 
 PROG = "lesvi"
+
+
+def log_level(verbose: int) -> int:
+    """Map ``-v`` repeats to a log level: quiet, INFO, then DEBUG."""
+    if verbose <= 0:
+        return logging.WARNING
+    if verbose == 1:
+        return logging.INFO
+    return logging.DEBUG
+
+
+def _configure_logging(verbose: int) -> None:
+    """Send logs to stderr (journald captures both streams for a unit)."""
+    level = log_level(verbose)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            stream=sys.stderr,
+            format="%(levelname)s %(name)s: %(message)s",
+        )
+    root.setLevel(level)
 
 
 def _fail(message: str) -> int:
@@ -121,15 +144,10 @@ def _cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_list(args: argparse.Namespace) -> int:
-    config = Config.load()
-    shelves = config.shelves()
-    if not shelves:
-        print(f"no shelves registered in {config.path}")
-        return 0
-
+def _shelf_entries(config: Config) -> list[dict[str, object]]:
+    """One summary per registered shelf: path, existence and category counts."""
     entries: list[dict[str, object]] = []
-    for name, table in shelves.items():
+    for name, table in config.shelves().items():
         stored = str(table.get("path", ""))
         path = resolve_path(stored, config.path.parent)
         exists = path.is_dir()
@@ -147,20 +165,54 @@ def _cmd_list(args: argparse.Namespace) -> int:
                 "categories": counts,
             }
         )
+    return entries
+
+
+def _category_detail(entry: dict[str, object]) -> str:
+    """A shelf's categories as ``lessons 3, reference 1`` (or ``missing``)."""
+    categories = entry["categories"]
+    assert isinstance(categories, dict)  # built by _shelf_entries
+    if not entry["exists"]:
+        return "missing"
+    return ", ".join(f"{key} {value}" for key, value in categories.items())
+
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    config = Config.load()
+    entries = _shelf_entries(config)
+    if not entries:
+        print(f"no shelves registered in {config.path}")
+        return 0
 
     if args.json:
         print(json.dumps(entries, indent=2, default=str))
         return 0
 
     for entry in entries:
+        print(f"{entry['name']}  {entry['path']}  {_category_detail(entry)}")
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    """What is registered, how many artifacts it holds, and is it running."""
+    config = Config.load(Path(args.config).expanduser() if args.config else None)
+    entries = _shelf_entries(config)
+    artifacts = 0
+    for entry in entries:
         categories = entry["categories"]
-        assert isinstance(categories, dict)  # built above
-        detail = (
-            ", ".join(f"{key} {value}" for key, value in categories.items())
-            if entry["exists"]
-            else "missing"
-        )
-        print(f"{entry['name']}  {entry['path']}  {detail}")
+        assert isinstance(categories, dict)  # built by _shelf_entries
+        artifacts += sum(categories.values())
+
+    print(f"config:    {config.path}")
+    print(f"server:    {config.host()}:{config.port()}")
+    public_url = config.public_url()
+    if public_url:
+        print(f"public:    {public_url}")
+    print(f"service:   {service.unit_state()}")
+    print(f"shelves:   {len(entries)}")
+    print(f"artifacts: {artifacts}")
+    for entry in entries:
+        print(f"{entry['name']}  {entry['path']}  {_category_detail(entry)}")
     return 0
 
 
@@ -198,10 +250,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         server = make_server(index, host, port)
     except OSError as exc:
-        raise ConfigError(
-            f"cannot bind {host}:{port}: {exc}; is another process listening? "
-            f"try: ss -tlnp | grep {port}"
-        ) from exc
+        if exc.errno == errno.EADDRINUSE:
+            raise ConfigError(
+                f"port {port} is already in use on {host}; "
+                f"find the culprit with: ss -tlnp | grep {port}"
+            ) from exc
+        raise ConfigError(f"cannot bind {host}:{port}: {exc}") from exc
 
     watcher: Watcher | None = None
     if watch_enabled:
@@ -252,6 +306,29 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_service_install(args: argparse.Namespace) -> int:
+    config = Config.load(Path(args.config).expanduser() if args.config else None)
+    unit = service.install(config)
+    print(f"Installed {unit}")
+    print("Enable and start it now, and keep it running after logout:")
+    print()
+    print("  systemctl --user enable --now lesvi")
+    print("  loginctl enable-linger $USER")
+    return 0
+
+
+def _cmd_service_uninstall(_args: argparse.Namespace) -> int:
+    unit = service.uninstall()
+    print(f"Removed {unit}")
+    return 0
+
+
+def _cmd_service_status(_args: argparse.Namespace) -> int:
+    print(f"unit:  {service.unit_path()}")
+    print(f"state: {service.unit_state()}")
+    return 0
+
+
 def _port(value: str) -> int:
     """Argparse type: a TCP port, ``0`` meaning "pick an ephemeral port"."""
     try:
@@ -280,6 +357,13 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Single-port local library for agent-generated lessons and reference notes."
         ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="log more: -v for info, -vv for debug (default: warnings only)",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
@@ -326,7 +410,42 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="S",
         help="poll mtimes every S seconds; forces polling over watchfiles",
     )
+    serve_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=argparse.SUPPRESS,  # let the root flag stand when not repeated
+        help="log more: -v for info, -vv for debug",
+    )
     serve_parser.set_defaults(handler=_cmd_serve)
+
+    status_parser = subparsers.add_parser(
+        "status", help="what is registered and whether the service is running"
+    )
+    status_parser.add_argument("--config", help="config file (default $LESVI_CONFIG)")
+    status_parser.set_defaults(handler=_cmd_status)
+
+    service_parser = subparsers.add_parser(
+        "service", help="manage the always-on systemd user service"
+    )
+    service_actions = service_parser.add_subparsers(
+        dest="service_command", metavar="ACTION", required=True
+    )
+    service_install = service_actions.add_parser(
+        "install", help="write the user unit for this config"
+    )
+    service_install.add_argument(
+        "--config", help="config file (default $LESVI_CONFIG)"
+    )
+    service_install.set_defaults(handler=_cmd_service_install)
+    service_uninstall = service_actions.add_parser(
+        "uninstall", help="stop and remove the user unit"
+    )
+    service_uninstall.set_defaults(handler=_cmd_service_uninstall)
+    service_status = service_actions.add_parser(
+        "status", help="report the user unit state"
+    )
+    service_status.set_defaults(handler=_cmd_service_status)
 
     return parser
 
@@ -335,10 +454,11 @@ def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return the process exit code (0 ok, 1 error, 2 usage)."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_logging(getattr(args, "verbose", 0))
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
     if handler is None:  # a subcommand was added without wiring a handler
         parser.error(f"command '{args.command}' has no handler")
     try:
         return handler(args)
-    except (ConfigError, OSError) as exc:
+    except (ConfigError, OSError, service.ServiceError) as exc:
         return _fail(str(exc))

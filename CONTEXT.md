@@ -2,7 +2,7 @@
 
 `lesvi` (lessons view) is a single-port, always-on local server that turns agent-generated lessons and reference notes into a browsable, mobile-first library reachable through one Cloudflare tunnel hostname. Point it at folders — **shelves** — and it indexes what is already there, serves the originals untouched, and renders virtual dashboard pages. Nothing is ever written into your content folders.
 
-Status: v1 in progress — spec is [issue #1](https://github.com/arthishaxom/lesvi/issues/1); scaffold, shelf registration, the scan/index/serve spine, the browsing pages (home feed + shelf pages), agent metadata overrides (sidecar JSON + `lesvi:*` meta tags), and live index updates (native events or mtime polling, debounced) are in place.
+Status: v1 in progress — spec is [issue #1](https://github.com/arthishaxom/lesvi/issues/1); scaffold, shelf registration, the scan/index/serve spine, the browsing pages (home feed + shelf pages), agent metadata overrides (sidecar JSON + `lesvi:*` meta tags), live index updates (native events or mtime polling, debounced), and the always-on systemd user service (`lesvi service`, `lesvi status`, verbosity controls) are in place.
 
 ## Glossary
 

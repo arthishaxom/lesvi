@@ -12,8 +12,9 @@ your content folders.
 tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
 scaffold, shelf registration (`lesvi add` / `list` / `remove`), the scanning
 index behind `lesvi serve`, byte-for-byte raw artifact serving, the home feed /
-shelf pages, the agent metadata overrides (sidecar + `lesvi:*` meta tags), and
-live index updates (native events or mtime polling) are in place.
+shelf pages, the agent metadata overrides (sidecar + `lesvi:*` meta tags), live
+index updates (native events or mtime polling), and the always-on systemd user
+service (`lesvi service`, `lesvi status`, `-v` logging) are in place.
 
 ## Requirements
 
@@ -116,6 +117,45 @@ server-side pin: once you toggle that card, your choice wins over the
 declaration. Pins live in `~/.local/state/lesvi/state.json` (`$LESVI_STATE`) —
 never in a shelf folder. Broken sidecars or unusable meta tags are ignored field
 by field (logged at debug level), so the artifact keeps indexing.
+
+## Status
+
+```sh
+uv run lesvi status   # config, server address, service state, shelves, counts
+```
+
+`status` prints where the config lives, the bind address and public URL, the
+systemd user service state, and each shelf with its category counts (missing
+shelf folders are marked). It never touches a shelf.
+
+## Always-on service
+
+```sh
+uv run lesvi service install     # writes ~/.config/systemd/user/lesvi.service
+uv run lesvi service status      # active / inactive / failed / not installed
+uv run lesvi service uninstall   # stop, disable, remove the unit
+```
+
+`install` writes a systemd **user** unit (no sudo) whose `ExecStart` is the
+resolved `lesvi serve` invocation for your config, with `Restart=on-failure`.
+It only writes the unit — run the two commands it prints to start the service
+now and at every login:
+
+```sh
+systemctl --user enable --now lesvi
+loginctl enable-linger $USER   # keep serving after you log out (needed for phone access)
+```
+
+The unit runs the lesvi you invoked. If that was `uvx lesvi`, run
+`uv tool install "lesvi[watch]"` first so `ExecStart` names a durable install
+instead of a `uv` cache entry that pruning can remove.
+
+Logs land on stderr, which systemd routes to the journal
+(`journalctl --user -u lesvi -f`). Run `serve` with `-v` for INFO (requests,
+watcher decisions) or `-vv` for DEBUG; the default is warnings only.
+
+`serve` fails fast when its port is taken, naming the port and pointing at
+`ss -tlnp | grep <port>` to find the culprit.
 
 ## Development
 
