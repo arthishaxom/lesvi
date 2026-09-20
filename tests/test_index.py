@@ -318,3 +318,147 @@ def test_to_json_reports_the_metadata_source_and_never_the_seed(
     assert records["lessons/0001-alpha.html"]["meta_source"] == "sidecar"
     assert records["reference/cheatsheet.html"]["meta_source"] == "meta"
     assert "pin_seed" not in records["lessons/0001-alpha.html"]
+
+
+# --- incremental updates (issue #10) ------------------------------------------
+
+
+def test_changed_upserts_one_record_and_resorts_the_views(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Lesson 1 — Alpha</title>")
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))
+    record = next(iter(index.artifacts))
+    updated = replace(record, title="Alpha, revised")
+
+    changed = index.changed("shelf", upsert=[updated])
+
+    assert changed is not index
+    assert index.by_number("shelf")[0].title == "Alpha"  # the old snapshot is intact
+    assert changed.by_number("shelf")[0].title == "Alpha, revised"
+    counts = {item.key: item.count for item in changed.shelves["shelf"].categories}
+    assert counts["lessons"] == 1
+    assert changed.to_json()["artifacts"][0]["title"] == "Alpha, revised"
+
+
+def test_changed_removes_records_and_updates_the_category_counts(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "reference/cheatsheet.html", "<p>c</p>")
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))
+
+    changed = index.changed("shelf", remove=["lessons/0001-alpha.html"])
+
+    assert [artifact.path for artifact in changed.by_number("shelf")] == [
+        "reference/cheatsheet.html"
+    ]
+    counts = {item.key: item.count for item in changed.shelves["shelf"].categories}
+    assert counts == {"lessons": 0, "reference": 1, "research": 0}
+    assert changed.shelves["shelf"].recency[0].path == "reference/cheatsheet.html"
+
+
+def test_changed_keeps_recency_order_after_a_modification(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    first = _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    second = _write(shelf, "lessons/0002-beta.html", "<p>b</p>")
+    os.utime(first, (1_700_000_000, 1_700_000_000))
+    os.utime(second, (1_700_000_100, 1_700_000_100))
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))
+    record = next(item for item in index.artifacts if item.path.endswith("alpha.html"))
+
+    touched = replace(record, mtime="2026-09-20T12:00:00+05:30")
+    changed = index.changed("shelf", upsert=[touched])
+
+    assert [artifact.path for artifact in changed.by_recency("shelf")] == [
+        "lessons/0001-alpha.html",
+        "lessons/0002-beta.html",
+    ]
+
+
+def test_changed_is_a_no_op_when_nothing_would_differ(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))
+
+    assert index.changed("shelf") is index
+    assert index.changed("shelf", upsert=list(index.artifacts)) is index
+    assert index.changed("shelf", remove=["lessons/missing.html"]) is index
+    assert index.changed("ghost", remove=["lessons/0001-alpha.html"]) is index
+
+
+def test_changed_applies_pin_state_and_seeds_to_new_records(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0002-beta.html", "<p>b</p>")
+    _write(shelf, "lessons/0002-beta.html.meta.json", '{"pin": true}')
+    state = PinState.load(tmp_path / "state.json")
+    state.set_pin("shelf/lessons/0001-alpha.html", True)
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf), state)
+
+    beta = next(item for item in index.artifacts if item.path.endswith("beta.html"))
+    changed = index.changed("shelf", upsert=[replace(beta, title="Beta, revised")])
+
+    pins = {artifact.path: artifact.pinned for artifact in changed.by_number("shelf")}
+    assert pins == {"lessons/0001-alpha.html": True, "lessons/0002-beta.html": True}
+
+
+def test_changed_recomputes_the_cross_shelf_views(tmp_path: Path) -> None:
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    _write(one, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(two, "lessons/0002-beta.html", "<p>b</p>")
+    index = Index.build(_shelf_config(tmp_path, one=one, two=two))
+    record = next(item for item in index.artifacts if item.shelf == "one")
+
+    changed = index.changed("one", upsert=[replace(record, title="Alpha, revised")])
+    added_elsewhere = index.changed(
+        "two",
+        upsert=[
+            replace(
+                record,
+                shelf="two",
+                path="reference/new.html",
+                url="/a/two/reference/new.html",
+                category="Reference",
+                category_key="reference",
+            )
+        ],
+    )
+
+    assert changed.visible_artifacts == changed.artifacts
+    assert len(changed.visible_artifacts) == 2
+    assert len(added_elsewhere.visible_artifacts) == 3
+    assert "reference/new.html" in [
+        artifact.path for artifact in added_elsewhere.by_number("two")
+    ]
+
+
+def test_changed_is_fast_at_five_thousand_artifacts(tmp_path: Path) -> None:
+    """One incremental change must stay under the 50 ms scale target."""
+    shelf = tmp_path / "scale"
+    for number in range(5000):
+        directory = shelf / ("lessons" if number % 3 else "reference/deep")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{number:04d}-topic-{number}.html").write_text(
+            f"<title>Lesson {number} — Topic {number}</title>"
+        )
+
+    index = Index.build(_shelf_config(tmp_path, scale=shelf))
+    record = next(
+        item
+        for item in index.artifacts
+        if item.path == "lessons/0001-topic-1.html"
+    )
+    new = replace(
+        record, path="lessons/5000-new.html", url="/a/scale/lessons/5000-new.html"
+    )
+
+    started = time.perf_counter()
+    changed = index.changed(
+        "scale", upsert=[new], remove=["reference/deep/0000-topic-0.html"]
+    )
+    elapsed = time.perf_counter() - started
+
+    assert len(changed.artifacts) == 5000
+    assert elapsed < 0.05, f"incremental update took {elapsed * 1000:.1f} ms"

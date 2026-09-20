@@ -111,13 +111,93 @@ def scan(config: Config) -> list[Artifact]:
     return records
 
 
+def scan_artifact(
+    name: str,
+    root: Path,
+    relative: str,
+    categories: Mapping[str, Sequence[str]],
+    ignore: Sequence[str],
+) -> Artifact | None:
+    """Index one shelf-relative file, or ``None`` when it is not an artifact.
+
+    The incremental seam the watcher uses: same ignore/sidecar/category rules as
+    a full scan, reading only this file's prefix and sidecar.
+    """
+    if not relative or is_sidecar(relative) or is_ignored(relative, ignore):
+        return None
+    if not _plain_relative(relative):
+        log.debug("rejecting non-relative artifact path: %r", relative)
+        return None
+    category_key = match_category(relative, categories)
+    if category_key is None:
+        return None
+    return _artifact(name, root, root.resolve(), relative, category_key)
+
+
+def scan_subtree(
+    name: str,
+    root: Path,
+    relative: str,
+    categories: Mapping[str, Sequence[str]],
+    ignore: Sequence[str],
+) -> list[Artifact]:
+    """Index the matching artifacts under one shelf-relative path.
+
+    *relative* is a directory (``""`` means the shelf root) or a file. The walk
+    mirrors a full scan: ignored directories are pruned and symlinked
+    directories are not followed. Anything that would escape the shelf root is
+    rejected.
+    """
+    if relative and not _plain_relative(relative):
+        log.debug("rejecting non-relative subtree path: %r", relative)
+        return []
+    target = root / relative if relative else root
+    if target.is_symlink() and target.is_dir():
+        return []  # a full scan never descends into a symlinked directory
+    if target.is_file():
+        record = scan_artifact(name, root, relative, categories, ignore)
+        return [record] if record is not None else []
+    if not target.is_dir():
+        return []
+    real_root = root.resolve()
+    records: list[Artifact] = []
+    for rel, category_key in _iter_matches(root, categories, ignore, start=target):
+        record = _artifact(name, root, real_root, rel, category_key)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _plain_relative(relative: str) -> bool:
+    """A shelf-relative path that may be joined onto a shelf root safely.
+
+    Absolute paths, traversal, empty segments and dot segments are rejected so
+    the public incremental helpers cannot be pointed outside the shelf.
+    """
+    if not relative or relative.startswith("/"):
+        return False
+    return all(part not in ("", ".", "..") for part in relative.split("/"))
+
+
+def match_category(
+    relative: str, categories: Mapping[str, Sequence[str]]
+) -> str | None:
+    """The first category key whose globs match *relative*; ``None`` otherwise."""
+    for key, patterns in categories.items():
+        if any(glob_match(pattern, relative) for pattern in patterns):
+            return key
+    return None
+
+
 def _iter_matches(
     root: Path,
     categories: Mapping[str, Sequence[str]],
     ignore: Sequence[str],
+    *,
+    start: Path | None = None,
 ) -> Iterator[tuple[str, str]]:
     """Yield ``(relative path, category key)`` in deterministic walk order."""
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(start if start is not None else root):
         here = Path(dirpath)
         dirnames[:] = [
             dirname
@@ -130,18 +210,9 @@ def _iter_matches(
             relative = _relative(root, here / filename)
             if is_ignored(relative, ignore):
                 continue
-            matched = _match_category(relative, categories)
+            matched = match_category(relative, categories)
             if matched is not None:
                 yield relative, matched
-
-
-def _match_category(
-    relative: str, categories: Mapping[str, Sequence[str]]
-) -> str | None:
-    for key, patterns in categories.items():
-        if any(glob_match(pattern, relative) for pattern in patterns):
-            return key
-    return None
 
 
 def _artifact(

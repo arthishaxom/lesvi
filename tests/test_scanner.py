@@ -15,7 +15,9 @@ from lesvi.scanner import (
     SIDECAR_READ_LIMIT,
     _format_mtime,  # pyright: ignore[reportPrivateUsage]
     scan,
+    scan_artifact,
     scan_shelf,
+    scan_subtree,
 )
 
 
@@ -379,3 +381,153 @@ def test_a_sidecar_symlink_inside_the_shelf_root_is_followed(tmp_path: Path) -> 
     record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
 
     assert record.title == "Shared"
+
+
+# --- the incremental seam (issue #10) -----------------------------------------
+
+
+def test_scan_artifact_indexes_one_matching_file(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Lesson 1 — Alpha</title>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"title": "Enriched"}')
+
+    record = scan_artifact(
+        "s", shelf, "lessons/0001-alpha.html", PRESET_CATEGORIES, PRESET_IGNORES
+    )
+
+    assert record is not None
+    assert record.path == "lessons/0001-alpha.html"
+    assert record.title == "Enriched"
+    assert record.meta_source == "sidecar"
+
+
+def test_scan_artifact_rejects_everything_that_is_not_an_artifact(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _preset_shelf(shelf)
+    cases = [
+        "lessons/0001-alpha.html.meta.json",  # a sidecar is never an artifact
+        "assets/styles.css",  # ignored by the preset
+        "index.html",  # ignored by the preset
+        "learning-records/export.html",  # ignored by the preset
+        ".hidden/secret.html",  # dotpath
+        "lessons/notes.txt",  # matches no category
+        "lessons/9999-missing.html",  # nothing on disk
+        "",  # the shelf root itself
+    ]
+
+    for relative in cases:
+        assert (
+            scan_artifact("s", shelf, relative, PRESET_CATEGORIES, PRESET_IGNORES)
+            is None
+        ), relative
+
+
+def test_scan_artifact_respects_custom_categories_and_ignores(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "notes/one.md", "# one")
+    _write(shelf, "notes/private/secret.md", "# secret")
+
+    match = scan_artifact("s", shelf, "notes/one.md", {"notes": ("notes/**/*.md",)}, ())
+    ignored = scan_artifact(
+        "s",
+        shelf,
+        "notes/private/secret.md",
+        {"notes": ("notes/**/*.md",)},
+        ("notes/private/**",),
+    )
+    unmatched = scan_artifact("s", shelf, "notes/one.md", PRESET_CATEGORIES, PRESET_IGNORES)
+
+    assert match is not None
+    assert match.category == "Notes"
+    assert ignored is None
+    assert unmatched is None
+
+
+def test_scan_artifact_skips_symlinks_that_escape_the_shelf_root(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside.html"
+    outside.write_text("<title>Outside</title>")
+    shelf = tmp_path / "shelf"
+    lessons = shelf / "lessons"
+    lessons.mkdir(parents=True)
+    os.symlink(outside, lessons / "0001-outside.html")
+
+    assert (
+        scan_artifact(
+            "s", shelf, "lessons/0001-outside.html", PRESET_CATEGORIES, PRESET_IGNORES
+        )
+        is None
+    )
+
+
+def test_scan_subtree_indexes_only_that_directory(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _preset_shelf(shelf)
+
+    records = scan_subtree("s", shelf, "reference", PRESET_CATEGORIES, PRESET_IGNORES)
+
+    assert [record.path for record in records] == [
+        "reference/cheatsheet.html",
+        "reference/kafka/deep.html",
+        "reference/research/notes.md",
+    ]
+
+
+def test_scan_subtree_of_a_single_file_indexes_just_that_file(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _preset_shelf(shelf)
+
+    records = scan_subtree(
+        "s", shelf, "lessons/0002-beta.html", PRESET_CATEGORIES, PRESET_IGNORES
+    )
+
+    assert [record.path for record in records] == ["lessons/0002-beta.html"]
+
+
+def test_scan_subtree_of_the_root_equals_a_full_scan(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _preset_shelf(shelf)
+
+    assert scan_subtree("s", shelf, "", PRESET_CATEGORIES, PRESET_IGNORES) == scan_shelf(
+        "s", shelf, PRESET_CATEGORIES, PRESET_IGNORES
+    )
+
+
+def test_scan_subtree_of_a_missing_or_symlinked_directory_is_empty(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _preset_shelf(shelf)
+    outside = tmp_path / "outside"
+    _write(outside, "secret.html", "<title>Secret</title>")
+    os.symlink(outside, shelf / "linked")
+
+    assert scan_subtree("s", shelf, "nope", PRESET_CATEGORIES, PRESET_IGNORES) == []
+    assert scan_subtree("s", shelf, "linked", PRESET_CATEGORIES, PRESET_IGNORES) == []
+
+
+def test_the_incremental_helpers_reject_paths_outside_the_shelf(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _preset_shelf(shelf)
+    outside = _write(tmp_path, "outside.html", "<title>Outside</title>")
+    hostile = [
+        "/etc/hostname",
+        str(outside),
+        "../outside.html",
+        "lessons/../outside.html",
+        "lessons/./0001-alpha.html",
+        "lessons//0001-alpha.html",
+        ".",
+        "..",
+    ]
+
+    for relative in hostile:
+        assert (
+            scan_artifact("s", shelf, relative, {"all": ("**/*",)}, ()) is None
+        ), relative
+        assert scan_subtree("s", shelf, relative, {"all": ("**/*",)}, ()) == [], relative

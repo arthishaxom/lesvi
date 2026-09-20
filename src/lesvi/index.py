@@ -7,7 +7,7 @@ path); recency is mtime descending.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -127,6 +127,51 @@ class Index:
         """Pinned visible artifacts across shelves, newest first."""
         return tuple(artifact for artifact in self.recent() if artifact.pinned)
 
+    def changed(
+        self,
+        shelf: str,
+        *,
+        upsert: Iterable[Artifact] = (),
+        remove: Iterable[str] = (),
+    ) -> Index:
+        """A new index with one shelf's artifacts upserted or removed.
+
+        Only the named shelf is touched; its category counts and sorted views
+        are recomputed and the cross-shelf views follow. Pin seeds and stored
+        decisions are applied as in :meth:`build`. Returns ``self`` when
+        nothing would differ, so callers can use an identity check to skip
+        notifying readers.
+        """
+        existing = self.shelves.get(shelf)
+        if existing is None:
+            return self
+        before = {record.path: record for record in existing.curriculum}
+        after = dict(before)
+        for path in remove:
+            after.pop(path, None)
+        for record in upsert:
+            after[record.path] = apply_pin(shelf, record, self.state)
+        if after == before:
+            return self
+
+        records = list(after.values())
+        counts = dict.fromkeys((category.key for category in existing.categories), 0)
+        for record in records:
+            if record.category_key in counts:
+                counts[record.category_key] += 1
+        updated = replace(
+            existing,
+            categories=tuple(
+                replace(category, count=counts[category.key])
+                for category in existing.categories
+            ),
+            curriculum=tuple(sorted(records, key=_curriculum_key)),
+            recency=tuple(sorted(records, key=_recency_order)),
+        )
+        shelves = dict(self.shelves)
+        shelves[shelf] = updated
+        return Index(shelves, state=self.state)
+
     def _hidden(self, artifact: Artifact) -> bool:
         shelf = self.shelves.get(artifact.shelf)
         if shelf is None:  # pragma: no cover - every artifact names its shelf
@@ -153,7 +198,7 @@ def _build_shelf(
     root = resolve_path(str(table.get("path", "")), config.path.parent)
     categories = shelf_categories(table)
     records = scan_shelf(name, root, categories, shelf_ignores(table))
-    records = [_apply_pin(name, record, state) for record in records]
+    records = [apply_pin(name, record, state) for record in records]
 
     counts = dict.fromkeys(categories, 0)
     for record in records:
@@ -177,11 +222,11 @@ def _build_shelf(
             for key, count in counts.items()
         ),
         curriculum=tuple(sorted(records, key=_curriculum_key)),
-        recency=tuple(sorted(records, key=_recency_key, reverse=True)),
+        recency=tuple(sorted(records, key=_recency_order)),
     )
 
 
-def _apply_pin(name: str, record: Artifact, state: PinState | None) -> Artifact:
+def apply_pin(name: str, record: Artifact, state: PinState | None) -> Artifact:
     """Resolve the artifact's effective pin: stored decision > seed > off."""
     pinned = (
         state.is_pinned(artifact_key(name, record.path), record.pin_seed)
@@ -198,3 +243,8 @@ def _curriculum_key(artifact: Artifact) -> tuple[bool, int, str]:
 
 def _recency_key(artifact: Artifact) -> float:
     return datetime.fromisoformat(artifact.mtime).timestamp()
+
+
+def _recency_order(artifact: Artifact) -> tuple[float, str]:
+    """Newest first with a path tie-break, so restart and incremental order agree."""
+    return (-_recency_key(artifact), artifact.path)

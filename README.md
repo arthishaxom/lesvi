@@ -12,8 +12,8 @@ your content folders.
 tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
 scaffold, shelf registration (`lesvi add` / `list` / `remove`), the scanning
 index behind `lesvi serve`, byte-for-byte raw artifact serving, the home feed /
-shelf pages, and the agent metadata overrides (sidecar + `lesvi:*` meta tags)
-are in place.
+shelf pages, the agent metadata overrides (sidecar + `lesvi:*` meta tags), and
+live index updates (native events or mtime polling) are in place.
 
 ## Requirements
 
@@ -23,6 +23,10 @@ are in place.
 Runtime dependency: [tomlkit](https://github.com/python-poetry/tomlkit) (pure
 Python), so `lesvi add` / `remove` preserve the comments and formatting in your
 hand-edited config.
+
+Optional: install the `watch` extra (`uvx lesvi[watch]`, or
+`uv tool install "lesvi[watch]"`) for native filesystem events. Without it,
+lesvi polls file mtimes every 2 seconds — same behavior, less efficient.
 
 ## Run
 
@@ -57,6 +61,8 @@ path), hand-editable at all times; unknown keys survive lesvi's edits.
 ```sh
 uv run lesvi serve              # binds the configured port (default 8787)
 uv run lesvi serve --port 9000  # one-off override
+uv run lesvi serve --no-watch   # serve the startup index, never rescan
+uv run lesvi serve --poll-interval 5   # force mtime polling every 5s
 ```
 
 `serve` scans every registered shelf into an in-memory index, renders the
@@ -68,6 +74,14 @@ it). Each indexed artifact and its relative assets are served byte-for-byte at
 (`/assets/app.css`, `/assets/app.js`) add the persisted theme toggle; pages
 read fine with JavaScript disabled. Search, the pin toggle and auth land with
 their feature tickets.
+
+The index keeps itself current while `serve` runs: writing, overwriting,
+renaming or deleting a lesson (or its `.meta.json` sidecar) updates the feed
+within one debounce tick (~300 ms) — no restart. With the `watch` extra, native
+filesystem events do the work; otherwise mtimes are polled every `poll_interval`
+seconds (default 2; `watch = false` or `--no-watch` disables watching, and
+`--poll-interval S` forces polling). Ignored paths stay ignored, bursts are
+debounced, and a chunked write is parsed once it settles.
 
 ## Enriching artifacts
 

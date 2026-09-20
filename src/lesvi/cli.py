@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -28,6 +29,7 @@ from lesvi.config import (
 from lesvi.index import Index
 from lesvi.server import make_server
 from lesvi.state import PinState
+from lesvi.watch import Watcher
 
 PROG = "lesvi"
 
@@ -183,7 +185,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     else:
         host = config.host()
     port = args.port if args.port is not None else config.port()
-    index = Index.build(config, PinState.load())
+    watch_enabled = config.watch() and not args.no_watch
+    poll_interval = (
+        args.poll_interval
+        if args.poll_interval is not None
+        else config.poll_interval()
+    )
+    # Passing --poll-interval is a request for polling, watchfiles or not.
+    prefer_watchfiles = args.poll_interval is None
+    state = PinState.load()
+    index = Index.build(config, state)
     try:
         server = make_server(index, host, port)
     except OSError as exc:
@@ -192,13 +203,38 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             f"try: ss -tlnp | grep {port}"
         ) from exc
 
+    watcher: Watcher | None = None
+    if watch_enabled:
+
+        def publish(updated: Index) -> None:
+            server.index = updated
+
+        watcher = Watcher(
+            config,
+            index,
+            state=state,
+            poll_interval=poll_interval,
+            prefer_watchfiles=prefer_watchfiles,
+            on_update=publish,
+        )
+
     bound_host, bound_port = (
         str(server.server_address[0]),
         int(server.server_address[1]),
     )
+    # Attach the watcher before announcing the URL: anything written once a
+    # reader can reach the server is guaranteed to be seen.
+    if watcher is not None:
+        watcher.start()
     print(f"config:    {config.path}")
     print(f"shelves:   {len(index.shelves)}")
     print(f"artifacts: {len(index.artifacts)}")
+    if watcher is None:
+        print("watch:     off")
+    elif watcher.using_watchfiles:
+        print("watch:     native (watchfiles)")
+    else:
+        print(f"watch:     polling every {poll_interval:g}s")
     print(f"local:     http://{bound_host}:{bound_port}")
     public_url = config.public_url()
     if public_url:
@@ -210,6 +246,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print()  # move the shell prompt off the ^C
     finally:
+        if watcher is not None:
+            watcher.stop()
         server.server_close()
     return 0
 
@@ -222,6 +260,17 @@ def _port(value: str) -> int:
         raise argparse.ArgumentTypeError("port must be an integer") from exc
     if not 0 <= number <= 65535:
         raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return number
+
+
+def _positive_seconds(value: str) -> float:
+    """Argparse type: a finite, positive number of seconds."""
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("interval must be a number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("interval must be positive")
     return number
 
 
@@ -266,6 +315,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument("--host", help="bind address (default 127.0.0.1)")
     serve_parser.add_argument("--config", help="config file (default $LESVI_CONFIG)")
+    serve_parser.add_argument(
+        "--no-watch",
+        action="store_true",
+        help="serve the startup index without watching shelves",
+    )
+    serve_parser.add_argument(
+        "--poll-interval",
+        type=_positive_seconds,
+        metavar="S",
+        help="poll mtimes every S seconds; forces polling over watchfiles",
+    )
     serve_parser.set_defaults(handler=_cmd_serve)
 
     return parser

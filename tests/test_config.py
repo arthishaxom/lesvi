@@ -259,14 +259,19 @@ def test_server_settings_default_and_override(tmp_path: Path) -> None:
     assert default.port() == 8787
     assert default.host() == "127.0.0.1"
     assert default.public_url() == ""
+    assert default.watch() is True
+    assert default.poll_interval() == 2.0
 
     config_file.write_text(
         'port = 9000\nhost = "0.0.0.0"\npublic_url = "https://lesvi.example.com"\n'
+        "watch = false\npoll_interval = 0.5\n"
     )
     configured = Config.load(config_file)
     assert configured.port() == 9000
     assert configured.host() == "0.0.0.0"
     assert configured.public_url() == "https://lesvi.example.com"
+    assert configured.watch() is False
+    assert configured.poll_interval() == 0.5
 
 
 @pytest.mark.parametrize(
@@ -280,6 +285,15 @@ def test_server_settings_default_and_override(tmp_path: Path) -> None:
         ('host = ""\n', "host"),
         ("host = '   '\n", "host"),
         ("public_url = 7\n", "public_url"),
+        ('watch = "yes"\n', "watch"),
+        ("watch = 1\n", "watch"),
+        ("poll_interval = 0\n", "poll_interval"),
+        ("poll_interval = -1\n", "poll_interval"),
+        ("poll_interval = true\n", "poll_interval"),
+        ('poll_interval = "2"\n', "poll_interval"),
+        ("poll_interval = inf\n", "poll_interval"),
+        ("poll_interval = -inf\n", "poll_interval"),
+        ("poll_interval = nan\n", "poll_interval"),
     ],
 )
 def test_bad_server_settings_raise_config_error(

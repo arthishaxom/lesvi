@@ -8,6 +8,7 @@ formatting, and unknown keys all survive ``lesvi add`` / ``lesvi remove``.
 from __future__ import annotations
 
 import fnmatch
+import math
 import os
 import re
 import tempfile
@@ -285,6 +286,25 @@ class Config:
         if not isinstance(raw, str):
             raise ConfigError(f"{self.path}: 'public_url' must be a string")
         return raw
+
+    def watch(self) -> bool:
+        """Whether to watch shelves for changes (default true)."""
+        raw = self.data.get("watch", True)
+        if not isinstance(raw, bool):
+            raise ConfigError(f"{self.path}: 'watch' must be a boolean")
+        return raw
+
+    def poll_interval(self) -> float:
+        """Seconds between mtime polls when ``watchfiles`` is unavailable."""
+        raw = self.data.get("poll_interval", 2.0)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ConfigError(f"{self.path}: 'poll_interval' must be a number")
+        interval = float(raw)
+        if not math.isfinite(interval) or interval <= 0:
+            raise ConfigError(
+                f"{self.path}: 'poll_interval' must be a positive, finite number"
+            )
+        return interval
 
     def find_shelf_by_path(self, path: Path) -> str | None:
         """Return the name of the shelf registered at *path*, if any."""

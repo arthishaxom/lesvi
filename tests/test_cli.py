@@ -13,10 +13,11 @@ import sys
 import time
 import tomllib
 import urllib.request
+from collections.abc import Callable
 from importlib.metadata import entry_points
 from importlib.metadata import version as distribution_version
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import pytest
 
@@ -559,7 +560,10 @@ def test_serve_prints_the_banner_and_serves_the_index(tmp_path: Path) -> None:
 
 
 def _start_serve(
-    tmp_path: Path, config: Path, state: Path | None = None
+    tmp_path: Path,
+    config: Path,
+    state: Path | None = None,
+    *extra: str,
 ) -> tuple[subprocess.Popen[str], list[str], str]:
     """Start ``lesvi serve`` on an ephemeral port; return (process, banner, url)."""
     environment = {
@@ -568,7 +572,17 @@ def _start_serve(
         "LESVI_STATE": str(state if state is not None else tmp_path / "state.json"),
     }
     process = subprocess.Popen(
-        [sys.executable, "-m", "lesvi", "serve", "--port", "0", "--config", str(config)],
+        [
+            sys.executable,
+            "-m",
+            "lesvi",
+            "serve",
+            "--port",
+            "0",
+            "--config",
+            str(config),
+            *extra,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -577,6 +591,24 @@ def _start_serve(
     assert process.stdout is not None
     lines, local_url = _read_serve_banner(process.stdout)
     return process, lines, local_url
+
+
+def _fetch_index(local_url: str) -> dict[str, Any]:
+    with urllib.request.urlopen(f"{local_url}/api/index.json", timeout=5) as resp:
+        return json.load(resp)
+
+
+def _wait_for_index(
+    local_url: str, predicate: Callable[[dict[str, Any]], bool], timeout: float = 5.0
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    payload = _fetch_index(local_url)
+    while time.monotonic() < deadline:
+        if predicate(payload):
+            return payload
+        time.sleep(0.05)
+        payload = _fetch_index(local_url)
+    return payload
 
 
 def test_serve_reads_stored_pins_from_the_state_file(tmp_path: Path) -> None:
@@ -645,3 +677,94 @@ def test_serve_honours_the_port_configured_in_the_file(tmp_path: Path) -> None:
         process.communicate(timeout=10)
 
     assert local_url.startswith("http://127.0.0.1:")
+
+
+# --- live updates (issue #10) -------------------------------------------------
+
+
+@pytest.mark.parametrize("interval", ["0", "-1", "abc", "nan", "inf"])
+def test_serve_rejects_bad_poll_intervals_as_usage_errors(
+    interval: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["serve", "--poll-interval", interval])
+
+    assert excinfo.value.code == 2
+    assert "poll-interval" in capsys.readouterr().err
+
+
+def test_serve_picks_up_a_new_lesson_without_a_restart(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    config.write_text(f'[shelves.data-engg]\npath = "{shelf}"\n')
+
+    process, lines, local_url = _start_serve(tmp_path, config, None, "--poll-interval", "0.05")
+    try:
+        assert any("watch:" in line and "polling" in line for line in lines)
+        (shelf / "lessons" / "0002-live.html").write_text(
+            "<title>Lesson 2 — Live Update</title><p>Published while serving.</p>"
+        )
+        payload = _wait_for_index(
+            local_url,
+            lambda data: data["shelves"]["data-engg"]["total"] == 2,
+        )
+        with urllib.request.urlopen(f"{local_url}/", timeout=5) as resp:
+            home = resp.read().decode()
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert payload["shelves"]["data-engg"]["total"] == 2
+    assert any(
+        record["title"] == "Live Update" for record in payload["artifacts"]
+    )
+    assert "Live Update" in home
+    assert "/a/data-engg/lessons/0002-live.html" in home
+
+
+def test_serve_no_watch_keeps_serving_the_startup_index(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    config.write_text(f'[shelves.data-engg]\npath = "{shelf}"\n')
+
+    process, lines, local_url = _start_serve(
+        tmp_path, config, None, "--no-watch", "--poll-interval", "0.05"
+    )
+    try:
+        assert any("watch:     off" in line for line in lines)
+        (shelf / "lessons" / "0002-after-start.html").write_text(
+            "<title>Lesson 2 — After Start</title>"
+        )
+        time.sleep(0.6)  # long enough for a fast poll to have landed
+        payload = _fetch_index(local_url)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert payload["shelves"]["data-engg"]["total"] == 1
+    assert payload["artifacts"][0]["path"] == "lessons/0001-intro.html"
+
+
+def test_serve_honours_watch_false_in_the_config(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    config.write_text(
+        f'watch = false\npoll_interval = 0.05\n[shelves.data-engg]\npath = "{shelf}"\n'
+    )
+
+    process, lines, local_url = _start_serve(tmp_path, config)
+    try:
+        assert any("watch:     off" in line for line in lines)
+        (shelf / "lessons" / "0002-after-start.html").write_text(
+            "<title>Lesson 2 — After Start</title>"
+        )
+        time.sleep(0.6)
+        payload = _fetch_index(local_url)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert payload["shelves"]["data-engg"]["total"] == 1
