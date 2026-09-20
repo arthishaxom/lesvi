@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from lesvi.config import (
@@ -47,6 +48,7 @@ class Shelf:
 
     name: str
     title: str
+    root: Path
     categories: tuple[CategoryInfo, ...]
     curriculum: tuple[Artifact, ...]
     recency: tuple[Artifact, ...]
@@ -117,6 +119,7 @@ def _build_shelf(name: str, table: Mapping[str, Any], config: Config) -> Shelf:
     return Shelf(
         name=name,
         title=title,
+        root=root.resolve(),
         categories=tuple(
             CategoryInfo(
                 key=key,
