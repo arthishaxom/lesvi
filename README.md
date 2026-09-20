@@ -11,8 +11,9 @@ your content folders.
 [issue #1](https://github.com/arthishaxom/lesvi/issues/1) and the work is
 tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
 scaffold, shelf registration (`lesvi add` / `list` / `remove`), the scanning
-index behind `lesvi serve`, byte-for-byte raw artifact serving, and the
-home feed / shelf pages are in place.
+index behind `lesvi serve`, byte-for-byte raw artifact serving, the home feed /
+shelf pages, and the agent metadata overrides (sidecar + `lesvi:*` meta tags)
+are in place.
 
 ## Requirements
 
@@ -65,8 +66,42 @@ virtual dashboards (`/` recency feed, `/s/<shelf>/` curriculum order with a
 it). Each indexed artifact and its relative assets are served byte-for-byte at
 `/a/<shelf>/<path>` with `ETag`/`Last-Modified` revalidation. The UI assets
 (`/assets/app.css`, `/assets/app.js`) add the persisted theme toggle; pages
-read fine with JavaScript disabled. Search, pins and auth land with their
-feature tickets.
+read fine with JavaScript disabled. Search, the pin toggle and auth land with
+their feature tickets.
+
+## Enriching artifacts
+
+lesvi fills every card from parsing heuristics first, but agents can override
+any field without touching the heuristics. Resolution is per field, first hit
+wins: **sidecar JSON > `lesvi:*` meta tags > heuristics** (ADR-0005).
+
+A sidecar sits next to the artifact as `<file>.meta.json`:
+
+```json
+{
+  "title": "Kafka, end to end",
+  "description": "Topics, partitions, offsets and consumer groups",
+  "tags": ["Track B", "Kafka"],
+  "pin": true
+}
+```
+
+Or in the artifact's `<head>`, one meta tag per field:
+
+```html
+<meta name="lesvi:title" content="Kafka, end to end">
+<meta name="lesvi:description" content="Topics, partitions, offsets and consumer groups">
+<meta name="lesvi:tags" content="Track B, Kafka">
+<meta name="lesvi:pin" content="true">
+```
+
+`tags` is a JSON list in a sidecar and a comma-separated string in a meta tag;
+either override replaces the whole tag list, and `"tags": []` clears it
+entirely. `number` always comes from the `NNNN` filename. `pin` only *seeds* the
+server-side pin: once you toggle that card, your choice wins over the
+declaration. Pins live in `~/.local/state/lesvi/state.json` (`$LESVI_STATE`) —
+never in a shelf folder. Broken sidecars or unusable meta tags are ignored field
+by field (logged at debug level), so the artifact keeps indexing.
 
 ## Development
 

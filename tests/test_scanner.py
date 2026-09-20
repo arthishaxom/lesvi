@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from lesvi.config import PRESET_CATEGORIES, PRESET_IGNORES, Config
 from lesvi.scanner import (
     HTML_READ_LIMIT,
+    SIDECAR_READ_LIMIT,
     _format_mtime,  # pyright: ignore[reportPrivateUsage]
     scan,
     scan_shelf,
@@ -258,3 +260,122 @@ def test_scan_shelf_skips_non_regular_files(tmp_path: Path) -> None:
     records = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)
 
     assert [record.path for record in records] == ["lessons/0008-real.html"]
+
+
+# --- metadata overrides from sidecars and lesvi:* meta tags -------------------
+
+
+def test_scan_shelf_applies_a_sidecar_next_to_the_artifact(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Lesson 1 — Alpha</title>")
+    _write(
+        shelf,
+        "lessons/0001-alpha.html.meta.json",
+        '{"title": "Alpha, enriched", "description": "From the sidecar", '
+        '"tags": ["Track B"], "pin": true}',
+    )
+
+    record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Alpha, enriched"
+    assert record.description == "From the sidecar"
+    assert record.tags == ("Track B",)
+    assert record.meta_source == "sidecar"
+    assert record.pin_seed is True
+
+
+def test_scan_shelf_applies_lesvi_meta_tags(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(
+        shelf,
+        "lessons/0001-alpha.html",
+        "<title>Lesson 1 — Alpha</title>"
+        "<meta name='lesvi:title' content='Alpha from meta'>"
+        "<meta name='lesvi:tags' content='Track B, Kafka'>"
+        "<meta name='lesvi:pin' content='yes'>",
+    )
+
+    record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Alpha from meta"
+    assert record.tags == ("Track B", "Kafka")
+    assert record.meta_source == "meta"
+    assert record.pin_seed is True
+
+
+def test_sidecar_files_are_never_indexed_even_when_globs_match_them(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>x</p>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"title": "Override"}')
+
+    records = scan_shelf("s", shelf, {"all": ("lessons/**",)}, ())
+
+    assert [record.path for record in records] == ["lessons/0001-alpha.html"]
+    assert records[0].title == "Override"
+
+
+def test_a_broken_sidecar_leaves_the_artifact_indexable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Alpha</title>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", "{broken")
+
+    with caplog.at_level(logging.DEBUG, logger="lesvi.metadata"):
+        record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Alpha"
+    assert record.meta_source == "heuristic"
+    assert caplog.records
+
+
+def test_an_unreadable_sidecar_does_not_hide_the_artifact(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Alpha</title>")
+    sidecar = shelf / "lessons" / "0001-alpha.html.meta.json"
+    sidecar.mkdir()  # a directory, not a file
+
+    record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Alpha"
+
+
+def test_an_oversized_sidecar_degrades_to_heuristics(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Alpha</title>")
+    _write(
+        shelf,
+        "lessons/0001-alpha.html.meta.json",
+        '{"title": "' + "x" * (SIDECAR_READ_LIMIT + 100) + '"}',
+    )
+
+    record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Alpha"
+    assert record.meta_source == "heuristic"
+
+
+def test_a_sidecar_symlink_outside_the_shelf_root_is_ignored(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.meta.json"
+    outside.write_text('{"title": "Outside"}')
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Alpha</title>")
+    os.symlink(outside, shelf / "lessons" / "0001-alpha.html.meta.json")
+
+    record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Alpha"
+    assert record.meta_source == "heuristic"
+
+
+def test_a_sidecar_symlink_inside_the_shelf_root_is_followed(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Alpha</title>")
+    target = _write(shelf, "reference/shared.meta.json", '{"title": "Shared"}')
+    os.symlink(target, shelf / "lessons" / "0001-alpha.html.meta.json")
+
+    record = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)[0]
+
+    assert record.title == "Shared"

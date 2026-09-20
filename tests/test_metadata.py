@@ -1,17 +1,21 @@
-"""Tests for ``lesvi.metadata``: heuristic number/title/description/tags parsing.
+"""Tests for ``lesvi.metadata``: the ADR-0005 resolution layers.
 
 ``heuristic_metadata`` is a pure function over the relative path, the category
-label and (optionally) the first 64 KB of the artifact's text. These tests
-pin the ADR-0005 heuristic layer; sidecar and ``lesvi:*`` meta tags arrive
-with their own ticket.
+label and (optionally) the first 64 KB of the artifact's text.
+``resolve_metadata`` layers the two enrichment channels on top, field by
+field: sidecar JSON > ``lesvi:*`` meta tags > heuristics. Every layer is
+defensive: broken input degrades to the next source, never raises.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+
 import pytest
 
 import lesvi.metadata as metadata_module
-from lesvi.metadata import heuristic_metadata
+from lesvi.metadata import heuristic_metadata, resolve_metadata
 
 
 def test_filename_number_and_slug_title_without_html() -> None:
@@ -262,4 +266,347 @@ def test_an_exploding_parser_degrades_to_filename_metadata(
     assert metadata.number == 8
     assert metadata.title == "Kafka Basics"
     assert metadata.description == ""
+    assert metadata.tags == ("Lessons",)
+
+
+# --- sidecar JSON and ``lesvi:*`` meta tags -----------------------------------
+
+
+def test_sidecar_overrides_title_description_and_tags() -> None:
+    html = (
+        "<title>Lesson 24 — Kafka Basics</title>"
+        "<p class='subtitle'>Heuristic description</p>"
+        "<span class='badge'>Track A</span>"
+    )
+    sidecar = json.dumps(
+        {
+            "title": "Kafka, end to end",
+            "description": "Consumer groups and offsets",
+            "tags": ["Track B", "Kafka"],
+        }
+    )
+
+    metadata = resolve_metadata(
+        "lessons/0024-kafka.html", "Lessons", html, sidecar_text=sidecar
+    )
+
+    assert metadata.number == 24
+    assert metadata.title == "Kafka, end to end"
+    assert metadata.description == "Consumer groups and offsets"
+    assert metadata.tags == ("Track B", "Kafka")
+    assert metadata.meta_source == "sidecar"
+    assert metadata.pin_seed is False
+
+
+def test_meta_tags_override_heuristics_when_no_sidecar_exists() -> None:
+    html = (
+        "<title>Lesson 24 — Kafka Basics</title>"
+        "<meta name='lesvi:title' content='Kafka, end to end'>"
+        "<meta name='lesvi:description' content='Consumer groups and offsets'>"
+        "<meta name='lesvi:tags' content='Track B, Kafka'>"
+    )
+
+    metadata = resolve_metadata("lessons/0024-kafka.html", "Lessons", html)
+
+    assert metadata.number == 24
+    assert metadata.title == "Kafka, end to end"
+    assert metadata.description == "Consumer groups and offsets"
+    assert metadata.tags == ("Track B", "Kafka")
+    assert metadata.meta_source == "meta"
+
+
+def test_precedence_is_field_by_field_not_all_or_nothing() -> None:
+    html = "<title>Lesson 24 — Kafka Basics</title><p>Heuristic description.</p>"
+    sidecar = '{"title": "From the sidecar"}'
+
+    metadata = resolve_metadata(
+        "lessons/0024-kafka.html", "Lessons", html, sidecar_text=sidecar
+    )
+
+    assert metadata.title == "From the sidecar"  # sidecar
+    assert metadata.description == "Heuristic description."  # heuristics
+    assert metadata.tags == ("Lessons",)  # heuristics
+    assert metadata.meta_source == "sidecar"
+
+
+def test_sidecar_beats_meta_tags_field_by_field() -> None:
+    html = (
+        "<title>Lesson 24 — Kafka Basics</title>"
+        "<meta name='lesvi:title' content='From the meta tag'>"
+        "<meta name='lesvi:description' content='From the meta tag'>"
+        "<meta name='lesvi:tags' content='From the meta tag'>"
+    )
+    sidecar = '{"title": "From the sidecar", "tags": ["Sidecar Tag"]}'
+
+    metadata = resolve_metadata(
+        "lessons/0024-kafka.html", "Lessons", html, sidecar_text=sidecar
+    )
+
+    assert metadata.title == "From the sidecar"
+    assert metadata.description == "From the meta tag"
+    assert metadata.tags == ("Sidecar Tag",)
+    assert metadata.meta_source == "sidecar"
+
+
+def test_meta_tags_fall_back_to_heuristics_field_by_field() -> None:
+    html = (
+        "<title>Lesson 24 — Kafka Basics</title>"
+        "<p class='subtitle'>Heuristic description</p>"
+        "<meta name='lesvi:tags' content='Track B'>"
+    )
+
+    metadata = resolve_metadata("lessons/0024-kafka.html", "Lessons", html)
+
+    assert metadata.title == "Kafka Basics"
+    assert metadata.description == "Heuristic description"
+    assert metadata.tags == ("Track B",)
+    assert metadata.meta_source == "meta"
+
+
+def test_an_invalid_sidecar_degrades_to_meta_tags_then_heuristics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    html = (
+        "<title>Lesson 24 — Kafka Basics</title>"
+        "<meta name='lesvi:tags' content='Track B'>"
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="lesvi.metadata"):
+        metadata = resolve_metadata(
+            "lessons/0024-kafka.html",
+            "Lessons",
+            html,
+            sidecar_text="{not json",
+        )
+
+    assert metadata.title == "Kafka Basics"
+    assert metadata.tags == ("Track B",)
+    assert metadata.meta_source == "meta"
+    assert caplog.records
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    ["[1, 2]", '"title"', "null", "5", '{"title": "  "}'],
+)
+def test_a_broken_sidecar_never_overrides(
+    sidecar: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="lesvi.metadata"):
+        metadata = resolve_metadata(
+            "lessons/0001-x.html",
+            "Lessons",
+            "<title>Real Title</title>",
+            sidecar_text=sidecar,
+        )
+
+    assert metadata.title == "Real Title"
+    assert metadata.meta_source == "heuristic"
+    assert caplog.records
+
+
+def test_a_null_sidecar_field_is_absent_not_broken() -> None:
+    metadata = resolve_metadata(
+        "lessons/0001-x.html",
+        "Lessons",
+        "<title>Real Title</title>",
+        '{"title": null}',
+    )
+
+    assert metadata.title == "Real Title"
+    assert metadata.meta_source == "heuristic"
+
+
+def test_a_bom_prefixed_sidecar_is_still_read() -> None:
+    metadata = resolve_metadata(
+        "lessons/0001-x.html", "Lessons", "", '\ufeff{"title": "BOM Title"}'
+    )
+
+    assert metadata.title == "BOM Title"
+    assert metadata.meta_source == "sidecar"
+
+
+def test_an_empty_sidecar_tag_list_declares_no_tags() -> None:
+    metadata = resolve_metadata(
+        "lessons/0001-x.html",
+        "Lessons",
+        "<title>Alpha</title><span class='badge'>Track A</span>",
+        '{"tags": []}',
+    )
+
+    assert metadata.tags == ()
+    assert metadata.meta_source == "sidecar"
+
+
+def test_a_list_of_only_unusable_sidecar_tags_degrades() -> None:
+    metadata = resolve_metadata(
+        "lessons/0001-x.html", "Lessons", "", '{"tags": [42, "  ", null]}'
+    )
+
+    assert metadata.tags == ("Lessons",)
+    assert metadata.meta_source == "heuristic"
+
+
+def test_a_pin_only_sidecar_seeds_without_changing_display_metadata() -> None:
+    metadata = resolve_metadata(
+        "lessons/0001-x.html", "Lessons", "<title>Alpha</title>", '{"pin": true}'
+    )
+
+    assert metadata.title == "Alpha"
+    assert metadata.meta_source == "heuristic"
+    assert metadata.pin_seed is True
+
+
+def test_an_invalid_sidecar_field_degrades_without_dropping_valid_ones() -> None:
+    sidecar = '{"title": "Sidecar Title", "tags": "not a list"}'
+
+    metadata = resolve_metadata(
+        "lessons/0001-x.html", "Lessons", "<title>Real Title</title>", sidecar
+    )
+
+    assert metadata.title == "Sidecar Title"
+    assert metadata.tags == ("Lessons",)
+    assert metadata.meta_source == "sidecar"
+
+
+def test_sidecar_tags_keep_the_valid_entries_and_drop_the_rest() -> None:
+    sidecar = '{"tags": ["Track B", "", 42, "Track B ", " Kafka ", null]}'
+
+    metadata = resolve_metadata("lessons/0001-x.html", "Lessons", "", sidecar)
+
+    assert metadata.tags == ("Track B", "Kafka")
+
+
+def test_sidecar_unknown_keys_are_ignored() -> None:
+    sidecar = '{"title": "Sidecar Title", "number": 99, "extra": true}'
+
+    metadata = resolve_metadata(
+        "lessons/0024-kafka.html", "Lessons", "<title>Lesson 24 — Kafka</title>", sidecar
+    )
+
+    assert metadata.number == 24  # number has no override channel
+    assert metadata.title == "Sidecar Title"
+
+
+def test_sidecar_description_is_respected_whole_not_capped() -> None:
+    long_description = "x" * 200
+
+    metadata = resolve_metadata(
+        "lessons/0001-x.html",
+        "Lessons",
+        "",
+        json.dumps({"description": long_description}),
+    )
+
+    assert metadata.description == long_description
+
+
+def test_only_the_first_meta_tag_of_each_name_counts() -> None:
+    html = (
+        "<meta name='lesvi:title' content='First'>"
+        "<meta name='lesvi:title' content='Second'>"
+    )
+
+    assert resolve_metadata("lessons/0001-x.html", "Lessons", html).title == "First"
+
+
+def test_an_empty_first_meta_tag_does_not_block_a_later_one() -> None:
+    html = (
+        "<meta name='lesvi:title'>"
+        "<meta name='lesvi:title' content='The real one'>"
+    )
+
+    assert resolve_metadata("lessons/0001-x.html", "Lessons", html).title == "The real one"
+
+
+def test_meta_tag_names_are_case_insensitive_and_trimmed() -> None:
+    html = "<meta NAME=' Lesvi:Title ' content='Tolerant'>"
+
+    assert resolve_metadata("lessons/0001-x.html", "Lessons", html).title == "Tolerant"
+
+
+def test_meta_tags_work_with_content_before_name() -> None:
+    html = "<meta content='Kafka' name='lesvi:title'>"
+
+    assert resolve_metadata("lessons/0001-x.html", "Lessons", html).title == "Kafka"
+
+
+@pytest.mark.parametrize(
+    "meta", ["<meta name='lesvi:title'>", "<meta name='lesvi:other' content='x'>"]
+)
+def test_meta_tags_without_usable_content_are_ignored(
+    meta: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="lesvi.metadata"):
+        metadata = resolve_metadata(
+            "lessons/0001-x.html", "Lessons", f"<title>Alpha</title>{meta}"
+        )
+
+    assert metadata.title == "Alpha"
+    assert metadata.meta_source == "heuristic"
+    assert caplog.records
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "on"])
+def test_truthy_lesvi_pin_values_seed_a_pin(value: str) -> None:
+    html = f"<title>Alpha</title><meta name='lesvi:pin' content='{value}'>"
+
+    metadata = resolve_metadata("lessons/0001-x.html", "Lessons", html)
+
+    assert metadata.pin_seed is True
+    assert metadata.meta_source == "heuristic"  # pin is not display metadata
+
+
+@pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", "off"])
+def test_falsey_lesvi_pin_values_do_not_seed_a_pin(value: str) -> None:
+    html = f"<title>Alpha</title><meta name='lesvi:pin' content='{value}'>"
+
+    assert resolve_metadata("lessons/0001-x.html", "Lessons", html).pin_seed is False
+
+
+def test_a_garbage_lesvi_pin_value_is_ignored(caplog: pytest.LogCaptureFixture) -> None:
+    html = "<title>Alpha</title><meta name='lesvi:pin' content='maybe'>"
+
+    with caplog.at_level(logging.DEBUG, logger="lesvi.metadata"):
+        metadata = resolve_metadata("lessons/0001-x.html", "Lessons", html)
+
+    assert metadata.pin_seed is False
+    assert caplog.records
+
+
+def test_a_sidecar_pin_overrides_a_meta_tag_pin() -> None:
+    html = "<title>Alpha</title><meta name='lesvi:pin' content='true'>"
+
+    metadata = resolve_metadata(
+        "lessons/0001-x.html", "Lessons", html, '{"pin": false}'
+    )
+
+    assert metadata.pin_seed is False
+
+
+def test_a_sidecar_pin_must_be_a_boolean() -> None:
+    metadata = resolve_metadata(
+        "lessons/0001-x.html", "Lessons", "<title>Alpha</title>", '{"pin": "true"}'
+    )
+
+    assert metadata.pin_seed is False
+
+
+def test_resolve_metadata_never_raises_when_the_parser_explodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_html: str) -> metadata_module.HtmlFacts:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(metadata_module, "_parse_html", boom)
+
+    metadata = resolve_metadata(
+        "lessons/0008-kafka-basics.html",
+        "Lessons",
+        "<p>ignored</p>",
+        '{"title": "Sidecar Title"}',
+    )
+
+    assert metadata.number == 8
+    assert metadata.title == "Kafka Basics"
     assert metadata.tags == ("Lessons",)

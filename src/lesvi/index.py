@@ -8,7 +8,7 @@ path); recency is mtime descending.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from lesvi.config import (
     shelf_ignores,
 )
 from lesvi.scanner import Artifact, scan_shelf
+from lesvi.state import PinState, artifact_key
 
 
 @dataclass(frozen=True)
@@ -71,8 +72,13 @@ class Shelf:
 class Index:
     """A snapshot of every registered shelf; scanning happens in :meth:`build`."""
 
-    def __init__(self, shelves: Mapping[str, Shelf]) -> None:
+    def __init__(
+        self, shelves: Mapping[str, Shelf], state: PinState | None = None
+    ) -> None:
         self.shelves: dict[str, Shelf] = dict(shelves)
+        #: The reader's pin decisions, when the caller has them; ``None`` means
+        #: "no decisions", so declared pin seeds apply as-is.
+        self.state: PinState | None = state
         self.artifacts: tuple[Artifact, ...] = tuple(
             artifact for shelf in self.shelves.values() for artifact in shelf.curriculum
         )
@@ -83,13 +89,18 @@ class Index:
         )
 
     @classmethod
-    def build(cls, config: Config) -> Index:
-        """Scan every configured shelf into a fresh index."""
+    def build(cls, config: Config, state: PinState | None = None) -> Index:
+        """Scan every configured shelf into a fresh index.
+
+        When *state* is given, the reader's stored pin decisions are applied and
+        declared pin seeds are honoured; without it, seeds still pin artifacts.
+        """
         return cls(
             {
-                name: _build_shelf(str(name), table, config)
+                name: _build_shelf(str(name), table, config, state)
                 for name, table in config.shelves().items()
-            }
+            },
+            state=state,
         )
 
     def by_number(self, shelf: str) -> tuple[Artifact, ...]:
@@ -133,10 +144,16 @@ class Index:
         }
 
 
-def _build_shelf(name: str, table: Mapping[str, Any], config: Config) -> Shelf:
+def _build_shelf(
+    name: str,
+    table: Mapping[str, Any],
+    config: Config,
+    state: PinState | None,
+) -> Shelf:
     root = resolve_path(str(table.get("path", "")), config.path.parent)
     categories = shelf_categories(table)
     records = scan_shelf(name, root, categories, shelf_ignores(table))
+    records = [_apply_pin(name, record, state) for record in records]
 
     counts = dict.fromkeys(categories, 0)
     for record in records:
@@ -162,6 +179,16 @@ def _build_shelf(name: str, table: Mapping[str, Any], config: Config) -> Shelf:
         curriculum=tuple(sorted(records, key=_curriculum_key)),
         recency=tuple(sorted(records, key=_recency_key, reverse=True)),
     )
+
+
+def _apply_pin(name: str, record: Artifact, state: PinState | None) -> Artifact:
+    """Resolve the artifact's effective pin: stored decision > seed > off."""
+    pinned = (
+        state.is_pinned(artifact_key(name, record.path), record.pin_seed)
+        if state is not None
+        else record.pin_seed
+    )
+    return replace(record, pinned=pinned)
 
 
 def _curriculum_key(artifact: Artifact) -> tuple[bool, int, str]:

@@ -28,11 +28,15 @@ PRESET_IGNORES: tuple[str, ...] = (
     "learning-records/**",
     "assets/**",
     "index.html",
+    "**/*.meta.json",  # sidecars are metadata, never artifacts
     "node_modules/**",
 )
 
 # Indexed but hidden from v1 dashboards; markdown rendering is parked for v2.
 HIDDEN_CATEGORIES: frozenset[str] = frozenset({"research"})
+
+#: A ``<file>.meta.json`` next to an artifact is metadata, never an artifact.
+SIDECAR_SUFFIX = ".meta.json"
 
 DEFAULT_PORT = 8787
 DEFAULT_HOST = "127.0.0.1"
@@ -116,6 +120,11 @@ def is_ignored(rel: str, ignore: Sequence[str]) -> bool:
     return any(glob_match(pattern, rel) for pattern in ignore)
 
 
+def is_sidecar(rel: str) -> bool:
+    """True when a POSIX relative path names a ``<file>.meta.json`` sidecar."""
+    return rel.endswith(SIDECAR_SUFFIX)
+
+
 def category_counts(
     root: Path,
     categories: Mapping[str, Sequence[str]],
@@ -134,7 +143,7 @@ def category_counts(
         ]
         for filename in filenames:
             rel = _relative(root, here / filename)
-            if is_ignored(rel, ignore):
+            if is_ignored(rel, ignore) or is_sidecar(rel):
                 continue
             for category, patterns in categories.items():
                 if any(glob_match(pattern, rel) for pattern in patterns):

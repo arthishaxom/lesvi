@@ -170,7 +170,9 @@ def test_api_index_serves_the_documented_shape_with_no_store(
     record = payload["artifacts"][0]
     assert record["url"] == "/a/data-engg/lessons/0024-apache-kafka-fundamentals.html"
     assert record["number"] == 24
-    assert record["title"] == "Apache Kafka Fundamentals"
+    assert record["title"] == "Sidecar Override"  # the sidecar wins
+    assert record["description"] == "Topics and offsets."  # heuristics fill the rest
+    assert record["meta_source"] == "sidecar"
 
 
 def test_index_json_is_gzipped_when_the_client_accepts_it(

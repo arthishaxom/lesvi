@@ -28,7 +28,11 @@ def _run_cli(
     *args: str, config: Path, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Run ``python -m lesvi`` against an isolated ``LESVI_CONFIG``."""
-    env = {**os.environ, "LESVI_CONFIG": str(config)}
+    env = {
+        **os.environ,
+        "LESVI_CONFIG": str(config),
+        "LESVI_STATE": str(config.parent / "state.json"),
+    }
     return subprocess.run(
         [sys.executable, "-m", "lesvi", *args],
         capture_output=True,
@@ -530,7 +534,11 @@ def test_serve_prints_the_banner_and_serves_the_index(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env={**os.environ, "LESVI_CONFIG": str(ignored)},
+        env={
+            **os.environ,
+            "LESVI_CONFIG": str(ignored),
+            "LESVI_STATE": str(tmp_path / "state.json"),
+        },
     )
     try:
         assert process.stdout is not None
@@ -550,6 +558,67 @@ def test_serve_prints_the_banner_and_serves_the_index(tmp_path: Path) -> None:
     assert payload["shelves"]["data-engg"]["total"] == 1
 
 
+def _start_serve(
+    tmp_path: Path, config: Path, state: Path | None = None
+) -> tuple[subprocess.Popen[str], list[str], str]:
+    """Start ``lesvi serve`` on an ephemeral port; return (process, banner, url)."""
+    environment = {
+        **os.environ,
+        "LESVI_CONFIG": str(tmp_path / "unused-config.toml"),
+        "LESVI_STATE": str(state if state is not None else tmp_path / "state.json"),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-m", "lesvi", "serve", "--port", "0", "--config", str(config)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    assert process.stdout is not None
+    lines, local_url = _read_serve_banner(process.stdout)
+    return process, lines, local_url
+
+
+def test_serve_reads_stored_pins_from_the_state_file(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    config.write_text(f'[shelves.data-engg]\npath = "{shelf}"\n')
+    state = tmp_path / "state.json"
+    state.write_text(
+        '{"pins": ["data-engg/lessons/0001-intro.html"], '
+        '"explicit": ["data-engg/lessons/0001-intro.html"]}\n'
+    )
+
+    process, _lines, local_url = _start_serve(tmp_path, config, state)
+    try:
+        with urllib.request.urlopen(f"{local_url}/api/index.json", timeout=5) as resp:
+            payload = json.load(resp)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert payload["artifacts"][0]["pinned"] is True
+
+
+def test_serve_shows_a_pin_seeded_by_a_sidecar(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    (shelf / "lessons" / "0001-intro.html.meta.json").write_text('{"pin": true}')
+    config.write_text(f'[shelves.data-engg]\npath = "{shelf}"\n')
+
+    process, _lines, local_url = _start_serve(tmp_path, config)
+    try:
+        with urllib.request.urlopen(f"{local_url}/api/index.json", timeout=5) as resp:
+            payload = json.load(resp)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert payload["artifacts"][0]["pinned"] is True
+
+
 def test_serve_honours_the_port_configured_in_the_file(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     shelf = tmp_path / "data-engg"
@@ -562,7 +631,11 @@ def test_serve_honours_the_port_configured_in_the_file(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env={**os.environ, "LESVI_CONFIG": str(config)},
+        env={
+            **os.environ,
+            "LESVI_CONFIG": str(config),
+            "LESVI_STATE": str(tmp_path / "state.json"),
+        },
     )
     try:
         assert process.stdout is not None

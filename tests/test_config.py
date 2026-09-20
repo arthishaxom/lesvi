@@ -14,6 +14,7 @@ from lesvi.config import (
     ConfigError,
     category_counts,
     glob_match,
+    is_sidecar,
     matches_preset,
     resolve_path,
     shelf_categories,
@@ -164,6 +165,33 @@ def test_category_counts_use_preset_globs_and_skip_ignored_paths(
         "research": 2,
     }
     assert category_counts(shelf, {"all": ("**/*.html",)}, PRESET_IGNORES) == {"all": 4}
+
+
+def test_category_counts_never_counts_sidecars(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    lessons = shelf / "lessons"
+    lessons.mkdir(parents=True)
+    (lessons / "0001-a.html").write_text("<p>x</p>")
+    (lessons / "0001-a.html.meta.json").write_text('{"title": "A"}')
+
+    # Even an ignore list that does not mention sidecars must not count them:
+    # a sidecar is metadata about an artifact, never an artifact itself.
+    counts = category_counts(shelf, {"all": ("lessons/**",)}, ("learning-records/**",))
+
+    assert counts == {"all": 1}
+
+
+@pytest.mark.parametrize(
+    ("rel", "expected"),
+    [
+        ("lessons/0001-a.html.meta.json", True),
+        ("a.meta.json", True),
+        ("lessons/0001-a.html", False),
+        ("lessons/meta.json", False),
+    ],
+)
+def test_is_sidecar(rel: str, expected: bool) -> None:
+    assert is_sidecar(rel) is expected
 
 
 def test_matches_preset_distinguishes_shelves_from_plain_folders(

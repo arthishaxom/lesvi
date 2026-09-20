@@ -27,6 +27,7 @@ from lesvi.config import (
 )
 from lesvi.index import Index
 from lesvi.server import make_server
+from lesvi.state import PinState
 
 PROG = "lesvi"
 
@@ -182,7 +183,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     else:
         host = config.host()
     port = args.port if args.port is not None else config.port()
-    index = Index.build(config)
+    index = Index.build(config, PinState.load())
     try:
         server = make_server(index, host, port)
     except OSError as exc:

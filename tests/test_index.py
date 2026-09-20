@@ -11,6 +11,7 @@ from pathlib import Path
 
 from lesvi.config import Config
 from lesvi.index import Index
+from lesvi.state import PinState
 
 
 def _write(root: Path, relative: str, text: str) -> Path:
@@ -252,3 +253,68 @@ def test_scale_target_five_thousand_artifacts(tmp_path: Path) -> None:
     # client accepts it; the transport budget is what has to stay under 1 MB.
     assert len(payload) > 1_000_000
     assert len(gzip.compress(payload, mtime=0)) < 1_000_000
+
+
+# --- pins: stored decisions and declared seeds (issue #8) ---------------------
+
+
+def test_build_applies_stored_pins_and_declared_seeds(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"pin": true}')
+    _write(shelf, "lessons/0002-beta.html", "<p>b</p>")
+    state = PinState.load(tmp_path / "state.json")
+    state.set_pin("shelf/lessons/0002-beta.html", True)
+
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf), state)
+
+    pins = {artifact.path: artifact.pinned for artifact in index.by_number("shelf")}
+    assert pins == {"lessons/0001-alpha.html": True, "lessons/0002-beta.html": True}
+
+
+def test_an_explicit_unpin_wins_over_a_seed_across_restarts(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"pin": true}')
+    config = _shelf_config(tmp_path, shelf=shelf)
+    state_file = tmp_path / "state.json"
+
+    seeded = Index.build(config, PinState.load(state_file))
+    assert seeded.by_number("shelf")[0].pinned is True
+
+    state = PinState.load(state_file)
+    state.set_pin("shelf/lessons/0001-alpha.html", False)
+    state.save()
+
+    after_restart = Index.build(config, PinState.load(state_file))
+    assert after_restart.by_number("shelf")[0].pinned is False
+
+
+def test_build_without_pin_state_still_reports_declared_seeds(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"pin": true}')
+
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))
+
+    assert index.by_number("shelf")[0].pinned is True
+
+
+def test_to_json_reports_the_metadata_source_and_never_the_seed(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<title>Lesson 1 — Alpha</title>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"title": "From sidecar"}')
+    _write(
+        shelf,
+        "reference/cheatsheet.html",
+        "<title>Cheatsheet</title><meta name='lesvi:tags' content='Track B'>",
+    )
+
+    payload = Index.build(_shelf_config(tmp_path, shelf=shelf)).to_json()
+    records = {record["path"]: record for record in payload["artifacts"]}
+
+    assert records["lessons/0001-alpha.html"]["meta_source"] == "sidecar"
+    assert records["reference/cheatsheet.html"]["meta_source"] == "meta"
+    assert "pin_seed" not in records["lessons/0001-alpha.html"]

@@ -19,19 +19,23 @@ from typing import Any
 from urllib.parse import quote
 
 from lesvi.config import (
+    SIDECAR_SUFFIX,
     Config,
     category_label,
     glob_match,
     is_ignored,
+    is_sidecar,
     resolve_path,
     shelf_categories,
     shelf_ignores,
 )
-from lesvi.metadata import heuristic_metadata
+from lesvi.metadata import resolve_metadata
 
 log = logging.getLogger(__name__)
 
 HTML_READ_LIMIT = 64 * 1024
+#: Sidecars are tiny; anything larger is not a sidecar we should trust.
+SIDECAR_READ_LIMIT = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,9 @@ class Artifact:
     pinned: bool = False
     meta_source: str = "heuristic"
     category_key: str = ""
+    #: Whether an enrichment channel declared this artifact pinned; the index
+    #: resolves it against :class:`lesvi.state.PinState`. Never in the API JSON.
+    pin_seed: bool = False
 
     def to_json(self) -> dict[str, Any]:
         record: dict[str, object] = {
@@ -118,6 +125,8 @@ def _iter_matches(
             if not is_ignored(_relative(root, here / dirname), ignore)
         ]
         for filename in sorted(filenames):
+            if is_sidecar(filename):
+                continue  # metadata about an artifact, never an artifact itself
             relative = _relative(root, here / filename)
             if is_ignored(relative, ignore):
                 continue
@@ -165,8 +174,11 @@ def _artifact(
     except UnicodeEncodeError:
         log.debug("skipping artifact with a non-UTF-8 name: %r", relative)
         return None
-    metadata = heuristic_metadata(
-        relative, category_label(category_key), _read_prefix(path)
+    metadata = resolve_metadata(
+        relative,
+        category_label(category_key),
+        _read_prefix(path),
+        _read_sidecar(path, real_root),
     )
     return Artifact(
         shelf=name,
@@ -180,6 +192,8 @@ def _artifact(
         tags=metadata.tags,
         mtime=_format_mtime(stat_result.st_mtime, path),
         size=stat_result.st_size,
+        meta_source=metadata.meta_source,
+        pin_seed=metadata.pin_seed,
     )
 
 
@@ -194,13 +208,34 @@ def _format_mtime(timestamp: float, path: Path) -> str:
         return datetime.fromtimestamp(0).astimezone().isoformat(timespec="seconds")
 
 
+def _read_sidecar(path: Path, real_root: Path) -> str | None:
+    """Read the artifact's ``<file>.meta.json`` sidecar; ``None`` when absent.
+
+    Sidecar symlinks get the same root check as artifact symlinks, so a link
+    cannot smuggle metadata in from outside the shelf.
+    """
+    sidecar = path.with_name(path.name + SIDECAR_SUFFIX)
+    if not sidecar.is_file():  # the common case: no sidecar at all
+        return None
+    if sidecar.is_symlink():
+        try:
+            resolved = sidecar.resolve(strict=True)
+        except OSError:
+            log.debug("skipping broken sidecar symlink %s", sidecar, exc_info=True)
+            return None
+        if not resolved.is_relative_to(real_root):
+            log.debug("skipping sidecar outside the shelf root: %s", sidecar)
+            return None
+    return _read_prefix(sidecar, SIDECAR_READ_LIMIT)
+
+
 def _read_prefix(path: Path, limit: int = HTML_READ_LIMIT) -> str | None:
     """Read at most *limit* bytes of *path*; ``None`` when it cannot be read."""
     try:
         with path.open("rb") as handle:
             return handle.read(limit).decode("utf-8", errors="replace")
     except OSError:
-        log.debug("cannot read artifact %s", path, exc_info=True)
+        log.debug("cannot read %s", path, exc_info=True)
         return None
 
 
