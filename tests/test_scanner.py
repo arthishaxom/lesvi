@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from lesvi.config import PRESET_CATEGORIES, PRESET_IGNORES, Config
-from lesvi.scanner import HTML_READ_LIMIT, _format_mtime, scan, scan_shelf
+from lesvi.scanner import (
+    HTML_READ_LIMIT,
+    _format_mtime,  # pyright: ignore[reportPrivateUsage]
+    scan,
+    scan_shelf,
+)
 
 
 def _write(root: Path, relative: str, text: str) -> Path:

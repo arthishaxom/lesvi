@@ -222,7 +222,7 @@ class _FactsParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._open: list[str] = []
         self._title_parts: list[str] | None = None
-        self._title_done = False
+        self._title_done: bool = False
         self._subtitle_element: str | None = None
         self._subtitle_parts: list[str] | None = None
         self._paragraph_element: str | None = None
@@ -261,13 +261,12 @@ class _FactsParser(HTMLParser):
             self._title_done = True
         if tag in self._open:
             del self._open[self._open.index(tag) :]
-        for element in (
-            self._subtitle_element,
-            self._paragraph_element,
-            self._tag_element,
-        ):
-            if element == tag:
-                self._clear(element)
+        if self._subtitle_element == tag:
+            self._subtitle_element = None
+        if self._paragraph_element == tag:
+            self._paragraph_element = None
+        if self._tag_element == tag:
+            self._tag_element = None
 
     def handle_data(self, data: str) -> None:
         if "title" in self._open and not self._title_done:
@@ -291,14 +290,6 @@ class _FactsParser(HTMLParser):
         if self._paragraph_element not in _BLOCK_CONTAINERS:
             self._paragraph_element = None
         if self._tag_element not in _BLOCK_CONTAINERS:
-            self._tag_element = None
-
-    def _clear(self, element: str) -> None:
-        if element == self._subtitle_element:
-            self._subtitle_element = None
-        if element == self._paragraph_element:
-            self._paragraph_element = None
-        if element == self._tag_element:
             self._tag_element = None
 
     @staticmethod

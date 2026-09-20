@@ -250,7 +250,7 @@ def test_a_block_badge_may_wrap_block_content() -> None:
 def test_an_exploding_parser_degrades_to_filename_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def boom(html: str) -> metadata_module.HtmlFacts:
+    def boom(_html: str) -> metadata_module.HtmlFacts:
         raise RuntimeError("boom")
 
     monkeypatch.setattr(metadata_module, "_parse_html", boom)

@@ -65,7 +65,7 @@ it). Raw artifacts, virtual dashboards and auth land with their feature tickets.
 
 ```sh
 uv run ruff check   # lint
-uv run mypy         # typecheck (strict)
+uv run basedpyright # typecheck
 uv run pytest       # tests
 ```
 

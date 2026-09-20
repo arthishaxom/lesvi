@@ -199,6 +199,9 @@ def _new_document() -> tomlkit.TOMLDocument:
 class Config:
     """A loaded config file; ``add_shelf``/``remove_shelf`` then ``save``."""
 
+    path: Path
+    data: tomlkit.TOMLDocument
+
     def __init__(self, path: Path, data: tomlkit.TOMLDocument) -> None:
         self.path = path
         self.data = data

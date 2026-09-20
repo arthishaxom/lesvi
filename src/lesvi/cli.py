@@ -37,7 +37,7 @@ def _fail(message: str) -> int:
     return 1
 
 
-def _cmd_version(args: argparse.Namespace) -> int:
+def _cmd_version(_args: argparse.Namespace) -> int:
     print(f"{PROG} {__version__}")
     return 0
 

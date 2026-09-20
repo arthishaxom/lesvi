@@ -10,7 +10,7 @@ import gzip
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, cast
+from typing import cast
 from urllib.parse import urlsplit
 
 from lesvi import __version__
@@ -23,7 +23,8 @@ log = logging.getLogger(__name__)
 class LesviServer(ThreadingHTTPServer):
     """A ``ThreadingHTTPServer`` that carries the in-memory index."""
 
-    daemon_threads = True
+    daemon_threads: bool = True
+    index: Index
 
     def __init__(self, address: tuple[str, int], index: Index) -> None:
         super().__init__(address, LesviRequestHandler)
@@ -31,8 +32,8 @@ class LesviServer(ThreadingHTTPServer):
 
 
 class LesviRequestHandler(BaseHTTPRequestHandler):
-    server_version = f"lesvi/{__version__}"
-    protocol_version = "HTTP/1.1"
+    server_version: str = f"lesvi/{__version__}"
+    protocol_version: str = "HTTP/1.1"
 
     @property
     def index(self) -> Index:
@@ -45,7 +46,7 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404, "not found")
 
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         log.info("%s - %s", self.address_string(), format % args)
 
     def _send_index(self) -> None:
