@@ -22,7 +22,7 @@ lesvi = "lesvi.cli:main"
 Repository = "https://github.com/arthishaxom/lesvi"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["mypy>=2", "pytest>=8", "ruff>=0.16"]
 
 [tool.hatch.version]
 path = "src/lesvi/__init__.py"
@@ -32,3 +32,7 @@ exclude = [".agents", "AGENTS.md", "skills-lock.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]

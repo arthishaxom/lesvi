@@ -34,7 +34,9 @@ uvx lesvi version
 ## Development
 
 ```sh
-uv run pytest
+uv run ruff check   # lint
+uv run mypy         # typecheck (strict)
+uv run pytest       # tests
 ```
 
 The package version has one source of truth: `__version__` in

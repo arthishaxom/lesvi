@@ -37,7 +37,9 @@ def test_console_script_prints_version() -> None:
     lesvi_script = shutil.which("lesvi")
     if lesvi_script is None:
         pytest.skip("the lesvi console script is not on PATH")
-    result = subprocess.run([lesvi_script, "version"], capture_output=True, text=True)
+    result = subprocess.run(
+        [lesvi_script, "version"], capture_output=True, text=True, check=False
+    )
     assert result.returncode == 0
     assert result.stdout.strip() == f"lesvi {lesvi.__version__}"
 
@@ -47,6 +49,7 @@ def test_module_invocation_prints_version() -> None:
         [sys.executable, "-m", "lesvi", "version"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0
     assert result.stdout.strip() == f"lesvi {lesvi.__version__}"
