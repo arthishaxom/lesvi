@@ -10,7 +10,8 @@ your content folders.
 **Status: v1 in progress.** The spec is
 [issue #1](https://github.com/arthishaxom/lesvi/issues/1) and the work is
 tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
-scaffold is in place; the CLI currently only reports its version.
+scaffold and shelf registration (`lesvi add` / `list` / `remove`) are in
+place.
 
 ## Requirements
 
@@ -30,6 +31,22 @@ Once published, no checkout is needed:
 ```sh
 uvx lesvi version
 ```
+
+## Shelves
+
+Register folders and lesvi indexes them in place — no file is ever copied,
+moved, or written.
+
+```sh
+uv run lesvi add ~/Learning        # one shelf per matching child folder
+uv run lesvi add ~/Dev/proj/lessons --single --name proj
+uv run lesvi list                  # name, path, category counts, missing marker
+uv run lesvi list --json
+uv run lesvi remove proj
+```
+
+Shelves live in `~/.config/lesvi/config.toml` (`$LESVI_CONFIG` overrides the
+path), hand-editable at all times; unknown keys survive lesvi's edits.
 
 ## Development
 
