@@ -11,7 +11,8 @@ your content folders.
 [issue #1](https://github.com/arthishaxom/lesvi/issues/1) and the work is
 tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
 scaffold, shelf registration (`lesvi add` / `list` / `remove`), the scanning
-index behind `lesvi serve` and byte-for-byte raw artifact serving are in place.
+index behind `lesvi serve`, byte-for-byte raw artifact serving, and the
+home feed / shelf pages are in place.
 
 ## Requirements
 
@@ -57,11 +58,15 @@ uv run lesvi serve              # binds the configured port (default 8787)
 uv run lesvi serve --port 9000  # one-off override
 ```
 
-`serve` scans every registered shelf into an in-memory index and serves it at
+`serve` scans every registered shelf into an in-memory index, renders the
+virtual dashboards (`/` recency feed, `/s/<shelf>/` curriculum order with a
+`?sort=recent` toggle; Research stays hidden in v1), and serves the index at
 `/api/index.json` (`Cache-Control: no-store`, gzipped when the client accepts
 it). Each indexed artifact and its relative assets are served byte-for-byte at
-`/a/<shelf>/<path>` with `ETag`/`Last-Modified` revalidation; virtual
-dashboards and auth land with their feature tickets.
+`/a/<shelf>/<path>` with `ETag`/`Last-Modified` revalidation. The UI assets
+(`/assets/app.css`, `/assets/app.js`) add the persisted theme toggle; pages
+read fine with JavaScript disabled. Search, pins and auth land with their
+feature tickets.
 
 ## Development
 

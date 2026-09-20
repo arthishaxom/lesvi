@@ -6,6 +6,7 @@ import gzip
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from lesvi.config import Config
@@ -175,6 +176,50 @@ def test_category_label_collisions_do_not_mix_counts(tmp_path: Path) -> None:
     }
 
     assert counts == {"data-notes": 1, "data_notes": 1}
+
+
+def test_cross_shelf_recency_view_is_newest_first_and_capped(tmp_path: Path) -> None:
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    oldest = _write(one, "lessons/0001-alpha.html", "<p>a</p>")
+    newest = _write(two, "lessons/0002-beta.html", "<p>b</p>")
+    middle = _write(one, "reference/cheatsheet.html", "<p>c</p>")
+    research = _write(one, "research/notes.md", "# notes")
+    os.utime(oldest, (1_700_000_000, 1_700_000_000))
+    os.utime(middle, (1_700_000_050, 1_700_000_050))
+    os.utime(newest, (1_700_000_100, 1_700_000_100))
+    os.utime(research, (1_700_000_200, 1_700_000_200))  # hidden, must stay out
+    index = Index.build(_shelf_config(tmp_path, one=one, two=two))
+
+    assert [artifact.path for artifact in index.recent()] == [
+        "lessons/0002-beta.html",
+        "reference/cheatsheet.html",
+        "lessons/0001-alpha.html",
+    ]
+    assert [artifact.path for artifact in index.recent(limit=2)] == [
+        "lessons/0002-beta.html",
+        "reference/cheatsheet.html",
+    ]
+
+
+def test_cross_shelf_pinned_view_keeps_only_pins_newest_first(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    first = _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    second = _write(shelf, "lessons/0002-beta.html", "<p>b</p>")
+    os.utime(first, (1_700_000_000, 1_700_000_000))
+    os.utime(second, (1_700_000_100, 1_700_000_100))
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))
+    records = index.shelves["shelf"].curriculum
+    pinned = replace(records[0], pinned=True)  # the older one
+    index = Index(
+        {"shelf": replace(index.shelves["shelf"], curriculum=(pinned, records[1]))}
+    )
+
+    assert [artifact.path for artifact in index.pinned()] == ["lessons/0001-alpha.html"]
+    assert [artifact.path for artifact in index.recent()] == [
+        "lessons/0002-beta.html",
+        "lessons/0001-alpha.html",
+    ]
 
 
 def test_scale_target_five_thousand_artifacts(tmp_path: Path) -> None:

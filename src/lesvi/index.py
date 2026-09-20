@@ -76,6 +76,11 @@ class Index:
         self.artifacts: tuple[Artifact, ...] = tuple(
             artifact for shelf in self.shelves.values() for artifact in shelf.curriculum
         )
+        # v1 renders the visible categories only; research stays indexed in
+        # ``/api/index.json`` but never reaches a card.
+        self.visible_artifacts: tuple[Artifact, ...] = tuple(
+            artifact for artifact in self.artifacts if not self._hidden(artifact)
+        )
 
     @classmethod
     def build(cls, config: Config) -> Index:
@@ -94,6 +99,31 @@ class Index:
     def by_recency(self, shelf: str) -> tuple[Artifact, ...]:
         """Recency order for *shelf*: mtime descending."""
         return self.shelves[shelf].recency
+
+    def recent(self, limit: int | None = None) -> tuple[Artifact, ...]:
+        """Visible artifacts across shelves, newest first; capped at *limit*."""
+        ordered = sorted(
+            self.visible_artifacts,
+            key=lambda artifact: (
+                -_recency_key(artifact),
+                artifact.shelf,
+                artifact.path,
+            ),
+        )
+        return tuple(ordered if limit is None else ordered[:limit])
+
+    def pinned(self) -> tuple[Artifact, ...]:
+        """Pinned visible artifacts across shelves, newest first."""
+        return tuple(artifact for artifact in self.recent() if artifact.pinned)
+
+    def _hidden(self, artifact: Artifact) -> bool:
+        shelf = self.shelves.get(artifact.shelf)
+        if shelf is None:  # pragma: no cover - every artifact names its shelf
+            return False
+        return any(
+            category.hidden and category.key == artifact.category_key
+            for category in shelf.categories
+        )
 
     def to_json(self) -> dict[str, Any]:
         """The ``/api/index.json`` payload: shelves (with sorted views) + artifacts."""

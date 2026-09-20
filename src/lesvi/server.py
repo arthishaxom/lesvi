@@ -19,17 +19,33 @@ from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from lesvi import __version__
 from lesvi.config import DEFAULT_HOST, DEFAULT_PORT
 from lesvi.index import Index
+from lesvi.render import (
+    HOME_PAGE_SIZE,
+    MAX_HOME_LIMIT,
+    RECENT_SORT,
+    render_home,
+    render_shelf,
+)
 
 log = logging.getLogger(__name__)
 
 ARTIFACT_PREFIX = "/a/"
+SHELF_PREFIX = "/s/"
+ASSET_PREFIX = "/assets/"
 CHUNK_SIZE = 64 * 1024
 OCTET_STREAM = "application/octet-stream"
+
+UI_ASSETS: dict[str, str] = {
+    "app.css": "text/css; charset=utf-8",
+    "app.js": "text/javascript; charset=utf-8",
+}
+
+_UI_DIR = Path(__file__).resolve().parent / "ui"
 
 CONTENT_TYPES: dict[str, str] = {
     ".html": "text/html; charset=utf-8",
@@ -96,16 +112,75 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
 
     def _respond(self, *, include_body: bool) -> None:
         try:
-            path = urlsplit(self.path).path
+            target = urlsplit(self.path)
         except ValueError:  # absolute-form target with a malformed IPv6 authority
             self.send_error(400, "bad request target")
             return
+        path = target.path
         if path == "/api/index.json":
             self._send_index(include_body=include_body)
         elif path.startswith(ARTIFACT_PREFIX):
             self._serve_artifact(path, include_body=include_body)
+        elif path == "/":
+            self._send_home(target.query, include_body=include_body)
+        elif path.startswith(SHELF_PREFIX):
+            self._send_shelf(path, target.query, include_body=include_body)
+        elif path.startswith(ASSET_PREFIX):
+            self._send_asset(path, include_body=include_body)
         else:
             self.send_error(404, "not found")
+
+    def _send_home(self, query: str, *, include_body: bool) -> None:
+        limit = _parse_limit(query)
+        self._send_html(render_home(self.index, limit=limit), include_body=include_body)
+
+    def _send_shelf(self, path: str, query: str, *, include_body: bool) -> None:
+        if not path.endswith("/"):
+            location = path + "/"
+            if query:
+                location += f"?{query}"
+            self._redirect(location)
+            return
+        name = unquote(path[len(SHELF_PREFIX) : -1])
+        shelf = self.index.shelves.get(name) if name and "/" not in name else None
+        if shelf is None:
+            self.send_error(404, "not found")
+            return
+        sort = RECENT_SORT if parse_qs(query).get("sort") == [RECENT_SORT] else ""
+        self._send_html(
+            render_shelf(self.index, name, sort=sort), include_body=include_body
+        )
+
+    def _send_html(self, body: str, *, include_body: bool) -> None:
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if include_body:
+            self.wfile.write(data)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(301)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _send_asset(self, path: str, *, include_body: bool) -> None:
+        name = path[len(ASSET_PREFIX) :]
+        content_type = UI_ASSETS.get(name)
+        if content_type is None:
+            self.send_error(404, "not found")
+            return
+        target = _UI_DIR / name
+        try:
+            stat_result = target.stat()
+        except OSError:
+            log.exception("UI asset missing from the package: %s", target)
+            self.send_error(404, "not found")
+            return
+        self._send_file(target, content_type, stat_result, include_body=include_body)
 
     def _send_index(self, *, include_body: bool) -> None:
         body = json.dumps(
@@ -133,6 +208,19 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
             self.send_error(404, "not found")
             return
         target, stat_result = resolved
+        self._send_file(
+            target, content_type_for(target), stat_result, include_body=include_body
+        )
+
+    def _send_file(
+        self,
+        target: Path,
+        content_type: str,
+        stat_result: os.stat_result,
+        *,
+        include_body: bool,
+    ) -> None:
+        """Send one regular file with validators, streaming it when wanted."""
         etag = _etag(stat_result)
         last_modified = formatdate(stat_result.st_mtime, usegmt=True)
         if self._not_modified(etag, stat_result.st_mtime):
@@ -143,7 +231,7 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("Content-Type", content_type_for(target))
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(stat_result.st_size))
         self.send_header("ETag", etag)
         self.send_header("Last-Modified", last_modified)
@@ -189,6 +277,20 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
 def content_type_for(path: Path) -> str:
     """MIME type by extension; unknown extensions download as bytes."""
     return CONTENT_TYPES.get(path.suffix.lower(), OCTET_STREAM)
+
+
+def _parse_limit(query: str) -> int:
+    """The home feed's card budget: ``limit`` clamped to sane bounds."""
+    values = parse_qs(query).get("limit")
+    if not values:
+        return HOME_PAGE_SIZE
+    try:
+        requested = int(values[0])
+    except ValueError:
+        return HOME_PAGE_SIZE
+    if requested < 1:
+        return HOME_PAGE_SIZE
+    return min(requested, MAX_HOME_LIMIT)
 
 
 def _resolve_artifact(index: Index, path: str) -> tuple[Path, os.stat_result] | None:

@@ -22,7 +22,7 @@ import pytest
 
 from lesvi.config import Config, resolve_path
 from lesvi.index import Index
-from lesvi.server import make_server
+from lesvi.server import LesviServer, make_server
 
 LESSON_PATH = "lessons/0024-apache-kafka-fundamentals.html"
 LESSON_BYTES = (
@@ -75,6 +75,17 @@ def shelf(tmp_path: Path) -> Path:
     _write(outside_dir, "secret.txt", "Outside Directory Secret")
     os.symlink(outside_dir, root / "linked-out")
     os.symlink("/etc/passwd", root / "lessons" / "0028-passwd.html")
+    # Deterministic recency for the feed tests: café newest, then the deep dive
+    # (also reachable through its alias), then 0024 as the oldest.
+    for offset, relative in enumerate(
+        (
+            LESSON_PATH,
+            "reference/kafka/deep.html",
+            "lessons/0027-café notes.html",
+        )
+    ):
+        stamp = 1_700_000_000 + offset * 100
+        os.utime(root / relative, (stamp, stamp))
     return root
 
 
@@ -94,17 +105,21 @@ def index(config: Config) -> Index:
 
 
 @pytest.fixture
-def server_address(index: Index) -> Iterator[tuple[str, int]]:
+def server(index: Index) -> Iterator[LesviServer]:
     server = make_server(index, "127.0.0.1", 0)
     thread = threading.Thread(
         target=lambda: server.serve_forever(poll_interval=0.01), daemon=True
     )
     thread.start()
-    host, port = str(server.server_address[0]), int(server.server_address[1])
-    yield host, port
+    yield server
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
+
+
+@pytest.fixture
+def server_address(server: LesviServer) -> tuple[str, int]:
+    return str(server.server_address[0]), int(server.server_address[1])
 
 
 def _get(
@@ -197,13 +212,220 @@ def test_a_wildcard_accept_encoding_gets_gzip(server_address: tuple[str, int]) -
     response.read()
 
 
-def test_unknown_paths_are_404_for_now(server_address: tuple[str, int]) -> None:
-    # Home and shelf pages arrive with their own ticket; only the API and raw
-    # artifacts exist yet.
-    for path in ("/", "/api/nope.json"):
+def test_unknown_api_paths_are_404(server_address: tuple[str, int]) -> None:
+    response = _get(server_address, "/api/nope.json")
+
+    assert response.status == 404
+    response.read()
+
+
+# --- the home feed and shelf pages --------------------------------------------
+
+
+def _artifact_hrefs(body: str) -> list[str]:
+    """Card links in document order; the page's own navigation is not /a/."""
+    return re.findall(r'href="(/a/[^"]+)"', body)
+
+
+def test_home_serves_the_cross_shelf_recency_feed(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/")
+    body = response.read().decode()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/html; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-store"
+    assert _artifact_hrefs(body) == [
+        "/a/data-engg/lessons/0027-caf%C3%A9%20notes.html",
+        "/a/data-engg/lessons/0025-deep-alias.html",
+        "/a/data-engg/reference/kafka/deep.html",
+        "/a/data-engg/lessons/0024-apache-kafka-fundamentals.html",
+    ]
+    assert 'href="/s/data-engg/"' in body  # shelf navigation
+    assert "research" not in body
+
+
+def test_home_shows_fifty_cards_then_a_show_more_link(
+    server_address: tuple[str, int], server: LesviServer, config: Config, shelf: Path
+) -> None:
+    for number in range(100, 160):
+        _write(shelf, f"lessons/{number:04d}-bulk.html", "<p>bulk</p>")
+    server.index = Index.build(config)
+
+    first = _get(server_address, "/")
+    first_body = first.read().decode()
+    more = _get(server_address, "/?limit=100")
+    more_body = more.read().decode()
+
+    assert first.status == 200
+    assert len(_artifact_hrefs(first_body)) == 50
+    assert 'href="/?limit=64"' in first_body  # 4 carded + 60 bulk artifacts
+    assert len(_artifact_hrefs(more_body)) == 64
+    assert "Show more" not in more_body
+
+
+def test_home_limit_is_clamped_and_garbage_falls_back_to_the_default(
+    server_address: tuple[str, int],
+) -> None:
+    for query in ("limit=0", "limit=-5", "limit=nope"):
+        response = _get(server_address, f"/?{query}")
+        assert response.status == 200
+        assert len(_artifact_hrefs(response.read().decode())) == 4, query
+
+
+def test_home_show_more_stops_at_the_maximum_limit(
+    server_address: tuple[str, int], server: LesviServer, config: Config, shelf: Path
+) -> None:
+    # 514 visible artifacts: past the 500 cap the link must stop offering a
+    # page the server would clamp back to the same one.
+    for number in range(100, 610):
+        _write(shelf, f"lessons/{number:04d}-bulk.html", "<p>bulk</p>")
+    server.index = Index.build(config)
+
+    halfway = _get(server_address, "/?limit=400")
+    halfway_body = halfway.read().decode()
+    capped = _get(server_address, "/?limit=600")
+    capped_body = capped.read().decode()
+
+    assert len(_artifact_hrefs(halfway_body)) == 400
+    assert 'href="/?limit=500"' in halfway_body
+    assert len(_artifact_hrefs(capped_body)) == 500  # clamped request
+    assert "Show more" not in capped_body
+
+
+def test_shelf_page_serves_curriculum_order(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/s/data-engg/")
+    body = response.read().decode()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/html; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-store"
+    assert _artifact_hrefs(body) == [
+        "/a/data-engg/lessons/0024-apache-kafka-fundamentals.html",
+        "/a/data-engg/lessons/0025-deep-alias.html",
+        "/a/data-engg/lessons/0027-caf%C3%A9%20notes.html",
+        "/a/data-engg/reference/kafka/deep.html",
+    ]
+    assert re.findall(r"<h2[^>]*>([^<]+)</h2>", body) == ["Lessons", "Reference"]
+    assert 'href="/s/data-engg/?sort=recent"' in body
+    assert "research" not in body
+
+
+def test_shelf_page_recent_toggle_reorders_by_mtime(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/s/data-engg/?sort=recent")
+
+    assert response.status == 200
+    assert _artifact_hrefs(response.read().decode()) == [
+        "/a/data-engg/lessons/0027-caf%C3%A9%20notes.html",
+        "/a/data-engg/lessons/0025-deep-alias.html",
+        "/a/data-engg/lessons/0024-apache-kafka-fundamentals.html",
+        "/a/data-engg/reference/kafka/deep.html",
+    ]
+
+
+def test_an_unknown_sort_falls_back_to_curriculum_order(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/s/data-engg/?sort=bogus")
+
+    assert response.status == 200
+    assert _artifact_hrefs(response.read().decode())[0] == (
+        "/a/data-engg/lessons/0024-apache-kafka-fundamentals.html"
+    )
+
+
+def test_shelf_url_without_a_trailing_slash_redirects(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/s/data-engg?sort=recent")
+
+    assert response.status == 301
+    assert response.getheader("Location") == "/s/data-engg/?sort=recent"
+    assert response.read() == b""
+
+
+def test_unknown_shelves_are_404(server_address: tuple[str, int]) -> None:
+    for path in ("/s/nope/", "/s/", "/s", "/s/data-engg/extra/"):
         response = _get(server_address, path)
-        assert response.status == 404
+        assert response.status == 404, path
         response.read()
+
+
+def test_head_mirrors_get_for_the_pages(server_address: tuple[str, int]) -> None:
+    home = _request(server_address, "HEAD", "/")
+    shelf = _request(server_address, "HEAD", "/s/data-engg/")
+    asset = _request(server_address, "HEAD", "/assets/app.css")
+
+    for response in (home, shelf):
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/html; charset=utf-8"
+        assert int(response.getheader("Content-Length") or 0) > 0
+        assert response.read() == b""
+    assert asset.status == 200
+    assert asset.getheader("Content-Type") == "text/css; charset=utf-8"
+    assert asset.read() == b""
+
+
+# --- UI assets and the theme contract -----------------------------------------
+
+
+def test_ui_assets_serve_with_types_and_revalidate(
+    server_address: tuple[str, int],
+) -> None:
+    css = _get(server_address, "/assets/app.css")
+    js = _get(server_address, "/assets/app.js")
+
+    assert css.status == 200
+    assert css.getheader("Content-Type") == "text/css; charset=utf-8"
+    assert js.status == 200
+    assert js.getheader("Content-Type") == "text/javascript; charset=utf-8"
+    assert css.read()
+    assert js.read()
+
+    etag = css.getheader("ETag") or ""
+    conditional = _get(server_address, "/assets/app.css", **{"If-None-Match": etag})
+    assert etag
+    assert conditional.status == 304
+    assert conditional.read() == b""
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/assets/nope.css",
+        "/assets/",
+        "/assets/../config.toml",
+        "/assets/app.css/extra",
+        "/assets/App.css",
+    ],
+)
+def test_only_the_known_ui_assets_are_served(
+    server_address: tuple[str, int], path: str
+) -> None:
+    response = _get(server_address, path)
+
+    assert response.status == 404, path
+    response.read()
+
+
+def test_pages_carry_the_ui_assets_and_the_theme_boot(
+    server_address: tuple[str, int],
+) -> None:
+    body = _get(server_address, "/").read().decode()
+
+    assert 'href="/assets/app.css"' in body
+    assert 'src="/assets/app.js" defer' in body
+    assert 'localStorage.getItem("lesvi-theme")' in body
+    assert (
+        '<meta name="viewport" content="width=device-width, initial-scale=1">' in body
+    )
+    assert '<main id="main"' in body
+    assert 'class="skip-link"' in body
 
 
 # --- raw artifacts: bytes, assets and content types ---------------------------
