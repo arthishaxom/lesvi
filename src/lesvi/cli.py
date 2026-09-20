@@ -1,7 +1,7 @@
 """Command-line surface for lesvi.
 
-``version``, ``add``, ``list`` and ``remove`` exist so far; the remaining
-commands from the spec (``serve``, ``url``, ``status``, ``service``) land with
+``version``, ``add``, ``list``, ``remove`` and ``serve`` exist so far; the
+remaining commands from the spec (``url``, ``status``, ``service``) land with
 their feature tickets.
 """
 
@@ -23,7 +23,10 @@ from lesvi.config import (
     shelf_categories,
     shelf_ignores,
     slugify,
+    validate_host,
 )
+from lesvi.index import Index
+from lesvi.server import make_server
 
 PROG = "lesvi"
 
@@ -169,6 +172,58 @@ def _cmd_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    config = Config.load(Path(args.config).expanduser() if args.config else None)
+    if args.host is not None:
+        try:
+            host = validate_host(args.host)
+        except ConfigError as exc:
+            raise ConfigError(f"--host: {exc}") from exc
+    else:
+        host = config.host()
+    port = args.port if args.port is not None else config.port()
+    index = Index.build(config)
+    try:
+        server = make_server(index, host, port)
+    except OSError as exc:
+        raise ConfigError(
+            f"cannot bind {host}:{port}: {exc}; is another process listening? "
+            f"try: ss -tlnp | grep {port}"
+        ) from exc
+
+    bound_host, bound_port = (
+        str(server.server_address[0]),
+        int(server.server_address[1]),
+    )
+    print(f"config:    {config.path}")
+    print(f"shelves:   {len(index.shelves)}")
+    print(f"artifacts: {len(index.artifacts)}")
+    print(f"local:     http://{bound_host}:{bound_port}")
+    public_url = config.public_url()
+    if public_url:
+        print(f"public:    {public_url}")
+    sys.stdout.flush()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()  # move the shell prompt off the ^C
+    finally:
+        server.server_close()
+    return 0
+
+
+def _port(value: str) -> int:
+    """Argparse type: a TCP port, ``0`` meaning "pick an ephemeral port"."""
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 0 <= number <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -203,6 +258,14 @@ def build_parser() -> argparse.ArgumentParser:
     remove_parser = subparsers.add_parser("remove", help="forget a registered shelf")
     remove_parser.add_argument("target", help="shelf name or path")
     remove_parser.set_defaults(handler=_cmd_remove)
+
+    serve_parser = subparsers.add_parser("serve", help="serve the library on one port")
+    serve_parser.add_argument(
+        "--port", type=_port, help="listen port, 0-65535 (default 8787)"
+    )
+    serve_parser.add_argument("--host", help="bind address (default 127.0.0.1)")
+    serve_parser.add_argument("--config", help="config file (default $LESVI_CONFIG)")
+    serve_parser.set_defaults(handler=_cmd_serve)
 
     return parser
 

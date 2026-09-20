@@ -31,6 +31,12 @@ PRESET_IGNORES: tuple[str, ...] = (
     "node_modules/**",
 )
 
+# Indexed but hidden from v1 dashboards; markdown rendering is parked for v2.
+HIDDEN_CATEGORIES: frozenset[str] = frozenset({"research"})
+
+DEFAULT_PORT = 8787
+DEFAULT_HOST = "127.0.0.1"
+
 
 class ConfigError(Exception):
     """A config file or shelf operation is invalid."""
@@ -58,6 +64,21 @@ _SLUG_RUN = re.compile(r"[^a-z0-9]+")
 def slugify(text: str) -> str:
     """Turn arbitrary text into a shelf slug: ``[a-z0-9-]+``, no edge dashes."""
     return _SLUG_RUN.sub("-", text.strip().lower()).strip("-")
+
+
+def category_label(key: str) -> str:
+    """Display label for a category key: ``data-notes`` -> ``Data Notes``."""
+    return key.replace("-", " ").replace("_", " ").strip().title()
+
+
+def validate_host(value: str) -> str:
+    """Return a usable bind address, stripped; reject empty/whitespace."""
+    host = value.strip()
+    if not host:
+        raise ConfigError(
+            "'host' must not be empty; use 0.0.0.0 to bind every interface"
+        )
+    return host
 
 
 def glob_match(pattern: str, rel: str) -> bool:
@@ -88,7 +109,8 @@ def _relative(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _is_ignored(rel: str, ignore: Sequence[str]) -> bool:
+def is_ignored(rel: str, ignore: Sequence[str]) -> bool:
+    """True when a POSIX relative path is a dotpath or matches an ignore glob."""
     if any(part.startswith(".") for part in rel.split("/")):
         return True
     return any(glob_match(pattern, rel) for pattern in ignore)
@@ -108,11 +130,11 @@ def category_counts(
         dirnames[:] = [
             name
             for name in sorted(dirnames)
-            if not _is_ignored(_relative(root, here / name), ignore)
+            if not is_ignored(_relative(root, here / name), ignore)
         ]
         for filename in filenames:
             rel = _relative(root, here / filename)
-            if _is_ignored(rel, ignore):
+            if is_ignored(rel, ignore):
                 continue
             for category, patterns in categories.items():
                 if any(glob_match(pattern, rel) for pattern in patterns):
@@ -225,6 +247,32 @@ class Config:
 
     def has_shelf(self, name: str) -> bool:
         return name in self.shelves()
+
+    def port(self) -> int:
+        """The configured listen port (default 8787), validated."""
+        raw = self.data.get("port", DEFAULT_PORT)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ConfigError(f"{self.path}: 'port' must be an integer")
+        if not 0 <= raw <= 65535:
+            raise ConfigError(f"{self.path}: 'port' must be between 0 and 65535")
+        return raw
+
+    def host(self) -> str:
+        """The configured bind address (default ``127.0.0.1``), validated."""
+        raw = self.data.get("host", DEFAULT_HOST)
+        if not isinstance(raw, str):
+            raise ConfigError(f"{self.path}: 'host' must be a string")
+        try:
+            return validate_host(raw)
+        except ConfigError as exc:
+            raise ConfigError(f"{self.path}: {exc}") from exc
+
+    def public_url(self) -> str:
+        """The optional public URL (e.g. a tunnel hostname); empty when unset."""
+        raw = self.data.get("public_url", "")
+        if not isinstance(raw, str):
+            raise ConfigError(f"{self.path}: 'public_url' must be a string")
+        return raw
 
     def find_shelf_by_path(self, path: Path) -> str | None:
         """Return the name of the shelf registered at *path*, if any."""

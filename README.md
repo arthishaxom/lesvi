@@ -10,8 +10,8 @@ your content folders.
 **Status: v1 in progress.** The spec is
 [issue #1](https://github.com/arthishaxom/lesvi/issues/1) and the work is
 tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
-scaffold and shelf registration (`lesvi add` / `list` / `remove`) are in
-place.
+scaffold, shelf registration (`lesvi add` / `list` / `remove`) and the scanning
+index behind `lesvi serve` are in place.
 
 ## Requirements
 
@@ -49,6 +49,17 @@ uv run lesvi remove proj
 
 Shelves live in `~/.config/lesvi/config.toml` (`$LESVI_CONFIG` overrides the
 path), hand-editable at all times; unknown keys survive lesvi's edits.
+
+## Serve
+
+```sh
+uv run lesvi serve              # binds the configured port (default 8787)
+uv run lesvi serve --port 9000  # one-off override
+```
+
+`serve` scans every registered shelf into an in-memory index and serves it at
+`/api/index.json` (`Cache-Control: no-store`, gzipped when the client accepts
+it). Raw artifacts, virtual dashboards and auth land with their feature tickets.
 
 ## Development
 

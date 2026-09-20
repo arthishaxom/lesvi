@@ -5,13 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import select
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
+import urllib.request
 from importlib.metadata import entry_points
 from importlib.metadata import version as distribution_version
 from pathlib import Path
+from typing import IO
 
 import pytest
 
@@ -452,3 +457,118 @@ def test_malformed_config_reports_an_error_not_a_traceback(tmp_path: Path) -> No
     assert result.returncode == 1
     assert "error" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def _read_serve_banner(stream: IO[str], timeout: float = 10.0) -> tuple[list[str], str]:
+    """Read ``serve`` stdout until the ``local:`` line; return (lines, URL).
+
+    Reads the raw file descriptor: ``TextIOWrapper.readline`` buffers ahead,
+    which would hide the remaining banner lines from ``select``.
+    """
+    descriptor = stream.fileno()
+    pending = b""
+    lines: list[str] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([descriptor], [], [], 0.1)
+        if not ready:
+            continue
+        chunk = os.read(descriptor, 4096)
+        if not chunk:
+            break
+        pending += chunk
+        while b"\n" in pending:
+            raw, pending = pending.split(b"\n", 1)
+            line = raw.decode("utf-8", errors="replace")
+            lines.append(line)
+            match = re.fullmatch(r"local:\s+(\S+)", line)
+            if match:
+                return lines, match.group(1)
+    raise AssertionError(f"no local URL in serve output: {lines!r}")
+
+
+@pytest.mark.parametrize("port", ["70000", "-1", "abc"])
+def test_serve_rejects_bad_ports_as_usage_errors(
+    port: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["serve", "--port", port])
+
+    assert excinfo.value.code == 2
+    assert "port" in capsys.readouterr().err
+
+
+def test_serve_rejects_an_empty_host_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["serve", "--host", "", "--config", str(tmp_path / "config.toml")])
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "--host" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_serve_prints_the_banner_and_serves_the_index(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    _run_cli("add", str(shelf), config=config)
+    ignored = tmp_path / "ignored.toml"
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "lesvi",
+            "serve",
+            "--port",
+            "0",
+            "--config",
+            str(config),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "LESVI_CONFIG": str(ignored)},
+    )
+    try:
+        assert process.stdout is not None
+        lines, local_url = _read_serve_banner(process.stdout)
+        with urllib.request.urlopen(
+            f"{local_url}/api/index.json", timeout=5
+        ) as response:
+            payload = json.load(response)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert any(line.startswith("config:") and str(config) in line for line in lines)
+    assert any(re.fullmatch(r"shelves:\s+1", line) for line in lines)
+    assert any(re.fullmatch(r"artifacts:\s+1", line) for line in lines)
+    assert local_url.startswith("http://127.0.0.1:")
+    assert payload["shelves"]["data-engg"]["total"] == 1
+
+
+def test_serve_honours_the_port_configured_in_the_file(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    shelf = tmp_path / "data-engg"
+    _make_shelf(shelf)
+    _run_cli("add", str(shelf), config=config)
+    config.write_text(f"port = 0\n{config.read_text()}")
+
+    process = subprocess.Popen(
+        [sys.executable, "-m", "lesvi", "serve", "--config", str(config)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "LESVI_CONFIG": str(config)},
+    )
+    try:
+        assert process.stdout is not None
+        _lines, local_url = _read_serve_banner(process.stdout)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert local_url.startswith("http://127.0.0.1:")

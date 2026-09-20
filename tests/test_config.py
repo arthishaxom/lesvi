@@ -225,6 +225,45 @@ def test_store_path_prefers_tilde_when_under_home(
     )
 
 
+def test_server_settings_default_and_override(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    default = Config.load(config_file)
+    assert default.port() == 8787
+    assert default.host() == "127.0.0.1"
+    assert default.public_url() == ""
+
+    config_file.write_text(
+        'port = 9000\nhost = "0.0.0.0"\npublic_url = "https://lesvi.example.com"\n'
+    )
+    configured = Config.load(config_file)
+    assert configured.port() == 9000
+    assert configured.host() == "0.0.0.0"
+    assert configured.public_url() == "https://lesvi.example.com"
+
+
+@pytest.mark.parametrize(
+    ("text", "method"),
+    [
+        ("port = 70000\n", "port"),
+        ("port = -1\n", "port"),
+        ("port = true\n", "port"),
+        ('port = "8787"\n', "port"),
+        ("host = 5\n", "host"),
+        ('host = ""\n', "host"),
+        ("host = '   '\n", "host"),
+        ("public_url = 7\n", "public_url"),
+    ],
+)
+def test_bad_server_settings_raise_config_error(
+    tmp_path: Path, text: str, method: str
+) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(text)
+
+    with pytest.raises(ConfigError):
+        getattr(Config.load(config_file), method)()
+
+
 def test_comments_and_hand_formatting_survive_add_and_remove(tmp_path: Path) -> None:
     config_file = tmp_path / "config.toml"
     config_file.write_text(
