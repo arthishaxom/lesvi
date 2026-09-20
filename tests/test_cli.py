@@ -299,7 +299,7 @@ def test_remove_deletes_the_entry_but_not_the_folder(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "data-engg" in result.stdout
     raw = tomllib.loads(config.read_text())
-    assert raw["shelves"] == {}
+    assert raw.get("shelves", {}) == {}
     assert (shelf / "lessons" / "0001-intro.html").exists()
 
 
@@ -426,7 +426,7 @@ def test_remove_relative_path_resolves_against_cwd(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     raw = tomllib.loads(config.read_text())
-    assert raw["shelves"] == {}
+    assert raw.get("shelves", {}) == {}
 
 
 def test_list_resolves_relative_config_paths_against_config_dir(

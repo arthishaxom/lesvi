@@ -29,7 +29,7 @@ Status: v1 approved — spec is [issue #1](https://github.com/arthishaxom/lesvi/
 - **Indexes are virtual** — `/` and `/s/<shelf>/` are generated; hand-made `index.html` files are ignored. ([ADR-0003](docs/adr/0003-virtual-index.md))
 - **One port, one hostname, auth at the edge** — server on configurable port (default `8787`); user adds one Cloudflare Tunnel public hostname + Access policy; app-level token fallback that also covers tunneled traffic. ([ADR-0004](docs/adr/0004-single-port-single-hostname-auth.md), [ADR-0008](docs/adr/0008-localhost-exemption-not-tunneled.md), [docs/cloudflare-setup.md](docs/cloudflare-setup.md))
 - **Metadata precedence** — sidecar > in-HTML `lesvi:*` meta tag > parsing heuristics. ([ADR-0005](docs/adr/0005-metadata-precedence.md))
-- **Python + uv, stdlib-first** — no runtime deps, optional `watchfiles`, plain HTML/CSS/JS UI, `uvx lesvi`. ([ADR-0006](docs/adr/0006-python-uv-stdlib-first.md))
+- **Python + uv, stdlib-first** — config editing via `tomlkit` ([ADR-0009](docs/adr/0009-tomlkit-config-editing.md)), optional `watchfiles`, plain HTML/CSS/JS UI, `uvx lesvi`. ([ADR-0006](docs/adr/0006-python-uv-stdlib-first.md))
 - **Preset + config overrides** — "bring your own convention" via `~/.config/lesvi/config.toml`; `lesvi add` writes entries with smart shelf detection. ([ADR-0007](docs/adr/0007-convention-preset-config.md))
 - **Personal-first, OSS-friendly** — config-driven, no hardcoded personal paths; README + license when published.
 - **Name** — `lesvi`; verified clean (PyPI 404, npm 404, no exact-name GitHub repo, 2026-09-15).

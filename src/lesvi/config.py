@@ -1,8 +1,8 @@
 """Configuration: the single source of truth for shelves and server settings.
 
 The file is ``${LESVI_CONFIG:-~/.config/lesvi/config.toml}``, hand-editable at
-all times. Reading uses stdlib :mod:`tomllib`; writing is hand-rolled because
-the stdlib has no TOML writer. Saves preserve unknown keys.
+all times. It is parsed and edited with :mod:`tomlkit`, so comments, key order,
+formatting, and unknown keys all survive ``lesvi add`` / ``lesvi remove``.
 """
 
 from __future__ import annotations
@@ -11,11 +11,12 @@ import fnmatch
 import os
 import re
 import tempfile
-import tomllib
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
+
+import tomlkit
+from tomlkit.exceptions import TOMLKitError
 
 PRESET_CATEGORIES: Mapping[str, tuple[str, ...]] = {
     "lessons": ("lessons/*.html",),
@@ -29,12 +30,6 @@ PRESET_IGNORES: tuple[str, ...] = (
     "index.html",
     "node_modules/**",
 )
-
-NEW_CONFIG_HEADER = """\
-# lesvi configuration - hand-editable at all times.
-# `lesvi add` and `lesvi remove` touch only [shelves.*]; every other key,
-# including keys lesvi does not know, is preserved as-is on save.
-"""
 
 
 class ConfigError(Exception):
@@ -167,101 +162,13 @@ def store_path(path: Path) -> str:
     return f"~/{relative.as_posix()}"
 
 
-# --- TOML writing (stdlib has no writer) -------------------------------------
-
-_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-def _format_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    for char, replacement in (
-        ("\n", "\\n"),
-        ("\r", "\\r"),
-        ("\t", "\\t"),
-        ("\b", "\\b"),
-        ("\f", "\\f"),
-    ):
-        escaped = escaped.replace(char, replacement)
-    escaped = "".join(
-        f"\\u{ord(char):04x}" if ord(char) < 0x20 or ord(char) == 0x7F else char
-        for char in escaped
+def _new_document() -> tomlkit.TOMLDocument:
+    document = tomlkit.document()
+    document.add(tomlkit.comment("lesvi configuration - hand-editable at all times."))
+    document.add(
+        tomlkit.comment("Comments, key order and formatting are preserved on save.")
     )
-    return f'"{escaped}"'
-
-
-def _comment_text(text: object) -> str:
-    """Collapse *text* to one line, dropping characters TOML comments forbid."""
-    cleaned = "".join(
-        char if char >= " " and char != "\x7f" else " " for char in str(text)
-    )
-    return " ".join(cleaned.split())
-
-
-def _format_key(key: str) -> str:
-    return key if _BARE_KEY.match(key) else _format_string(key)
-
-
-def _format_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return repr(value)
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
-    if isinstance(value, str):
-        return _format_string(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_format_value(item) for item in value) + "]"
-    raise ConfigError(f"cannot write TOML value {value!r}")
-
-
-def _is_array_of_tables(value: Any) -> bool:
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(isinstance(item, Mapping) for item in value)
-    )
-
-
-def dumps(
-    data: Mapping[str, Any],
-    comments: Mapping[tuple[str, ...], str] | None = None,
-) -> str:
-    """Serialize *data* to TOML text, preserving every key it holds."""
-    lines: list[str] = []
-    _write_table(lines, (), data, comments or {})
-    return "\n".join(lines).rstrip("\n") + "\n"
-
-
-def _write_table(
-    lines: list[str],
-    path: tuple[str, ...],
-    table: Mapping[str, Any],
-    comments: Mapping[tuple[str, ...], str],
-    *,
-    array_of_tables: bool = False,
-) -> None:
-    if path:
-        comment = _comment_text(comments[path]) if path in comments else ""
-        if comment:
-            lines.append(f"# {comment}")
-        body = ".".join(_format_key(part) for part in path)
-        lines.append(f"[[{body}]]" if array_of_tables else f"[{body}]")
-    children: list[tuple[str, Any]] = []
-    for key, value in table.items():
-        if isinstance(value, Mapping) or _is_array_of_tables(value):
-            children.append((key, value))
-        elif value is None:
-            continue
-        else:
-            lines.append(f"{_format_key(key)} = {_format_value(value)}")
-    for key, value in children:
-        if isinstance(value, Mapping):
-            _write_table(lines, path + (key,), value, comments)
-        else:
-            for item in value:
-                _write_table(lines, path + (key,), item, comments, array_of_tables=True)
-        lines.append("")
+    return document
 
 
 # --- Config model -------------------------------------------------------------
@@ -270,7 +177,7 @@ def _write_table(
 class Config:
     """A loaded config file; ``add_shelf``/``remove_shelf`` then ``save``."""
 
-    def __init__(self, path: Path, data: dict[str, Any]) -> None:
+    def __init__(self, path: Path, data: tomlkit.TOMLDocument) -> None:
         self.path = path
         self.data = data
 
@@ -278,11 +185,10 @@ class Config:
     def load(cls, path: Path | None = None) -> Config:
         target = path if path is not None else config_path()
         if not target.exists():
-            return cls(target, {"shelves": {}})
+            return cls(target, _new_document())
         try:
-            with target.open("rb") as handle:
-                data = tomllib.load(handle)
-        except tomllib.TOMLDecodeError as exc:
+            data = tomlkit.parse(target.read_text(encoding="utf-8"))
+        except TOMLKitError as exc:
             raise ConfigError(f"invalid TOML in {target}: {exc}") from exc
         shelves = data.get("shelves")
         if shelves is not None:
@@ -298,24 +204,37 @@ class Config:
                     )
         return cls(target, data)
 
+    def shelves(self) -> Mapping[str, Any]:
+        """The ``[shelves]`` table as loaded (empty when absent)."""
+        shelves = self.data.get("shelves")
+        if isinstance(shelves, Mapping):
+            return shelves
+        return {}
+
     def add_shelf(self, name: str, path: Path, *, title: str | None = None) -> None:
-        shelves = self.data.setdefault("shelves", {})
+        if "shelves" not in self.data:
+            self.data["shelves"] = tomlkit.table()
+        shelves = self.data["shelves"]
         if name in shelves:
             raise ConfigError(f"shelf {name!r} is already registered")
-        table: dict[str, Any] = {"path": store_path(path)}
+        table = tomlkit.table()
+        table["path"] = store_path(path)
         if title:
             table["title"] = title
         shelves[name] = table
 
     def has_shelf(self, name: str) -> bool:
-        return name in self.data.get("shelves", {})
+        return name in self.shelves()
 
     def find_shelf_by_path(self, path: Path) -> str | None:
         """Return the name of the shelf registered at *path*, if any."""
         wanted = path.resolve()
-        for name, table in self.data.get("shelves", {}).items():
-            stored = resolve_path(str(table.get("path", "")), self.path.parent)
-            if stored.resolve() == wanted:
+        for name, table in self.shelves().items():
+            stored = table.get("path")
+            if (
+                isinstance(stored, str)
+                and resolve_path(stored, self.path.parent).resolve() == wanted
+            ):
                 return str(name)
         return None
 
@@ -325,24 +244,20 @@ class Config:
         Returns the removed shelf's name. Raises :class:`ConfigError` when no
         entry matches; nothing else in the config is touched.
         """
-        shelves = self.data.get("shelves", {})
+        shelves = self.shelves()
         if target in shelves:
-            del shelves[target]
+            del self.data["shelves"][target]
             return target
         name = self.find_shelf_by_path(resolve_path(target, self.path.parent))
         if name is None:
             raise ConfigError(f"no shelf named or at {target!r}")
-        del shelves[name]
+        del self.data["shelves"][name]
         return name
 
     def save(self) -> None:
-        shelves = self.data.get("shelves", {})
-        comments: dict[tuple[str, ...], str] = {
-            ("shelves", str(name)): f"Shelf: {table.get('title', name)}"
-            for name, table in shelves.items()
-            if isinstance(table, Mapping)
-        }
-        text = NEW_CONFIG_HEADER + dumps(self.data, comments)
+        text = tomlkit.dumps(self.data)
+        if not text.endswith("\n"):
+            text += "\n"
         directory = self.path.parent
         if not directory.exists():
             directory.mkdir(parents=True, mode=0o700)

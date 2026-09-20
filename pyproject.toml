@@ -14,6 +14,9 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 dynamic = ["version"]
+dependencies = [
+    "tomlkit>=0.13",
+]
 
 [project.scripts]
 lesvi = "lesvi.cli:main"

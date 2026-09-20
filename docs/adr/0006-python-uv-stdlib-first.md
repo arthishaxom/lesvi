@@ -1,6 +1,6 @@
 # ADR-0006: Python + uv, stdlib-first
 
-- Status: Accepted
+- Status: Accepted — amended by [ADR-0009](0009-tomlkit-config-editing.md) (config editing uses `tomlkit`)
 - Date: 2026-09-15
 - Source: interview round 1; machine recon (Python 3.14.7 + uv 0.12.3, Node 24 available)
 
@@ -11,7 +11,7 @@ The tool is a personal utility that must be trivially runnable, agent-hackable, 
 ## Decision
 
 - Python ≥ 3.11 (developed on 3.14), packaged with `uv`/`pyproject.toml`; entry point `lesvi`; distributable as `uvx lesvi`.
-- **Zero runtime dependencies.** `http.server` (ThreadingHTTPServer), `tomllib`, `html.parser`, `json`, `argparse` cover the whole v1 surface.
+- **Stdlib-first, one dependency.** `http.server` (ThreadingHTTPServer), `html.parser`, `json`, `argparse` cover the whole v1 surface; config editing adds `tomlkit` (pure Python) so hand-edited files keep their comments and formatting ([ADR-0009](0009-tomlkit-config-editing.md)).
 - `watchfiles` is an **optional extra** for native filesystem events; without it, the server polls mtimes at a configurable interval (default 2s). Correctness never depends on the extra.
 - UI is plain HTML/CSS/JS rendered server-side from string templates; no build step, no framework.
 - MIT license.

@@ -107,8 +107,9 @@ def _cmd_add(args: argparse.Namespace) -> int:
     for name, path, title in planned:
         config.add_shelf(name, path, title=title)
     config.save()
+    shelves = config.shelves()
     for name, _path, _title in planned:
-        print(f"Added shelf {name!r} -> {config.data['shelves'][name]['path']}")
+        print(f"Added shelf {name!r} -> {shelves[name].get('path', '')}")
     for note in notes:
         print(note)
     return 0
@@ -116,7 +117,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
 
 def _cmd_list(args: argparse.Namespace) -> int:
     config = Config.load()
-    shelves = config.data.get("shelves", {})
+    shelves = config.shelves()
     if not shelves:
         print(f"no shelves registered in {config.path}")
         return 0

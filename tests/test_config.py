@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import tomllib
-from datetime import date
 from pathlib import Path
 
 import pytest
@@ -14,7 +13,6 @@ from lesvi.config import (
     Config,
     ConfigError,
     category_counts,
-    dumps,
     glob_match,
     matches_preset,
     resolve_path,
@@ -71,7 +69,7 @@ def test_remove_shelf_deletes_only_that_entry_and_keeps_unknown_keys(
     config.save()
 
     raw = tomllib.loads(config_file.read_text())
-    assert raw["shelves"] == {}
+    assert raw.get("shelves", {}) == {}
     assert raw["custom_key"] == "keep me"
     assert raw["custom_table"] == {"answer": 42}
 
@@ -88,7 +86,7 @@ def test_remove_shelf_accepts_a_path_and_rejects_unknown_names(
     reloaded.remove_shelf(str(tmp_path / "alpha"))
     reloaded.save()
     raw = tomllib.loads(config_file.read_text())
-    assert raw["shelves"] == {}
+    assert raw.get("shelves", {}) == {}
 
     with pytest.raises(ConfigError):
         Config.load(config_file).remove_shelf("never-registered")
@@ -227,21 +225,53 @@ def test_store_path_prefers_tilde_when_under_home(
     )
 
 
-def test_dumps_round_trips_awkward_values() -> None:
-    data = {
-        "port": 8787,
-        "ratio": 2.5,
-        "watch": True,
-        "note": 'quote " backslash \\ newline \n tab \t del \x7f \x01',
-        "empty": [],
-        "mixed": [1, 2, "three"],
-        "published": date(2026, 9, 20),
-        "nested": {"deep key": "value", "rows": [{"a": 1}, {"b": "x"}]},
-        "weird.key": "quoted key",
-        "unicode": "日本語",
-    }
+def test_comments_and_hand_formatting_survive_add_and_remove(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "# top of file, user-owned\n"
+        "port = 9999  # inline note\n"
+        "\n"
+        "# my shelf, do not lose this\n"
+        "[shelves.data-engg]\n"
+        'path = "~/Learning/data-engg"\n'
+    )
 
-    assert tomllib.loads(dumps(data)) == data
+    config = Config.load(config_file)
+    config.add_shelf("new-shelf", tmp_path / "new-shelf")
+    config.save()
+
+    text = config_file.read_text()
+    assert "# top of file, user-owned" in text
+    assert "# inline note" in text
+    assert "# my shelf, do not lose this" in text
+
+    updated = Config.load(config_file)
+    updated.remove_shelf("new-shelf")
+    updated.save()
+
+    text = config_file.read_text()
+    assert "# top of file, user-owned" in text
+    assert "# my shelf, do not lose this" in text
+
+
+def test_unusual_values_survive_a_save(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        "port = 8787\n"
+        "hex = 0x10\n"
+        'inline = { a = 1, b = "x" }\n'
+        "note = 'literal \\ backslash'\n"
+    )
+    before = tomllib.loads(config_file.read_text())
+
+    config = Config.load(config_file)
+    config.add_shelf("x", tmp_path / "x")
+    config.save()
+
+    after = tomllib.loads(config_file.read_text())
+    assert after["hex"] == before["hex"] == 16
+    assert after["inline"] == before["inline"] == {"a": 1, "b": "x"}
+    assert after["note"] == before["note"] == "literal \\ backslash"
 
 
 def test_add_with_a_multiline_title_cannot_corrupt_or_inject_config(

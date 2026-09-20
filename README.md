@@ -18,7 +18,9 @@ place.
 - Python ≥ 3.11
 - [uv](https://docs.astral.sh/uv/)
 
-Zero runtime dependencies.
+Runtime dependency: [tomlkit](https://github.com/python-poetry/tomlkit) (pure
+Python), so `lesvi add` / `remove` preserve the comments and formatting in your
+hand-edited config.
 
 ## Run
 
