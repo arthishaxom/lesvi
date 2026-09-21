@@ -261,7 +261,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if watch_enabled:
 
         def publish(updated: Index) -> None:
-            server.index = updated
+            server.set_index(updated)
 
         watcher = Watcher(
             config,

@@ -127,6 +127,34 @@ class Index:
         """Pinned visible artifacts across shelves, newest first."""
         return tuple(artifact for artifact in self.recent() if artifact.pinned)
 
+    def with_pins(self, state: PinState | None) -> Index:
+        """Re-resolve every record's effective pin against *state*.
+
+        Snapshots outlive the pin decisions they were built from — the
+        watcher keeps its own index while the server toggles pins — so a
+        caller that has just changed pins (or holds a fresh state) can heal
+        a stale snapshot. Returns ``self`` when nothing would differ.
+        """
+        shelves: dict[str, Shelf] = {}
+        changed = False
+        for name, shelf in self.shelves.items():
+            curriculum = tuple(
+                apply_pin(name, record, state) for record in shelf.curriculum
+            )
+            if curriculum == shelf.curriculum:
+                shelves[name] = shelf
+                continue
+            changed = True
+            resolved = {record.path: record for record in curriculum}
+            shelves[name] = replace(
+                shelf,
+                curriculum=curriculum,
+                recency=tuple(resolved[record.path] for record in shelf.recency),
+            )
+        if not changed and state is self.state:
+            return self
+        return Index(shelves, state=state)
+
     def changed(
         self,
         shelf: str,
@@ -138,9 +166,11 @@ class Index:
 
         Only the named shelf is touched; its category counts and sorted views
         are recomputed and the cross-shelf views follow. Pin seeds and stored
-        decisions are applied as in :meth:`build`. Returns ``self`` when
-        nothing would differ, so callers can use an identity check to skip
-        notifying readers.
+        decisions are applied as in :meth:`build`, and every shelf is
+        re-resolved against the current state so a pin decided after this
+        snapshot was built is not lost. Returns ``self`` when nothing would
+        differ, so callers can use an identity check to skip notifying
+        readers.
         """
         existing = self.shelves.get(shelf)
         if existing is None:
@@ -170,7 +200,29 @@ class Index:
         )
         shelves = dict(self.shelves)
         shelves[shelf] = updated
-        return Index(shelves, state=self.state)
+        return Index(shelves, state=self.state).with_pins(self.state)
+
+    def set_pin(self, shelf: str, path: str, pinned: bool) -> Index:
+        """Record the reader's pin decision and return the updated snapshot.
+
+        Writes the state file (the index's own :class:`PinState`, or the
+        documented default when the index was built without one) before
+        returning, so a persisted pin survives a restart. Raises ``KeyError``
+        for an artifact this index does not know.
+        """
+        table = self.shelves.get(shelf)
+        if table is None or not any(item.path == path for item in table.curriculum):
+            raise KeyError(artifact_key(shelf, path))
+        state = self.state if self.state is not None else PinState.load()
+        key = artifact_key(shelf, path)
+        pins, explicit = set(state.pins), set(state.explicit)
+        state.set_pin(key, pinned)
+        try:
+            state.save()
+        except OSError:
+            state.pins, state.explicit = pins, explicit
+            raise
+        return self.with_pins(state)
 
     def _hidden(self, artifact: Artifact) -> bool:
         shelf = self.shelves.get(artifact.shelf)

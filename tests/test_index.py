@@ -9,6 +9,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from lesvi.config import Config
 from lesvi.index import Index
 from lesvi.state import PinState
@@ -318,6 +320,104 @@ def test_to_json_reports_the_metadata_source_and_never_the_seed(
     assert records["lessons/0001-alpha.html"]["meta_source"] == "sidecar"
     assert records["reference/cheatsheet.html"]["meta_source"] == "meta"
     assert "pin_seed" not in records["lessons/0001-alpha.html"]
+
+
+# --- the pin toggle (issue #7) -------------------------------------------------
+
+
+def test_set_pin_persists_the_decision_and_updates_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    config = _shelf_config(tmp_path, shelf=shelf)
+    state_file = tmp_path / "state.json"
+    index = Index.build(config, PinState.load(state_file))
+
+    updated = index.set_pin("shelf", "lessons/0001-alpha.html", True)
+
+    assert updated is not index
+    assert updated.by_number("shelf")[0].pinned is True
+    assert index.by_number("shelf")[0].pinned is False  # the old snapshot is intact
+    assert PinState.load(state_file).pins == {"shelf/lessons/0001-alpha.html"}
+    # A restart rebuilds from the same state file and still sees the pin.
+    restarted = Index.build(config, PinState.load(state_file))
+    assert [artifact.path for artifact in restarted.pinned()] == [
+        "lessons/0001-alpha.html"
+    ]
+
+
+def test_set_pin_unpins_a_declared_seed_for_good(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0001-alpha.html.meta.json", '{"pin": true}')
+    config = _shelf_config(tmp_path, shelf=shelf)
+    state_file = tmp_path / "state.json"
+    index = Index.build(config, PinState.load(state_file))
+    assert index.by_number("shelf")[0].pinned is True
+
+    updated = index.set_pin("shelf", "lessons/0001-alpha.html", False)
+
+    assert updated.by_number("shelf")[0].pinned is False
+    restarted = Index.build(config, PinState.load(state_file))
+    assert restarted.by_number("shelf")[0].pinned is False
+
+
+def test_set_pin_rejects_an_unknown_artifact_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    state_file = tmp_path / "state.json"
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf), PinState.load(state_file))
+
+    with pytest.raises(KeyError):
+        index.set_pin("shelf", "lessons/missing.html", True)
+    with pytest.raises(KeyError):
+        index.set_pin("ghost", "lessons/0001-alpha.html", True)
+
+    assert index.pinned() == ()
+    assert not state_file.exists()
+
+
+def test_set_pin_without_an_attached_state_uses_the_documented_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    state_file = tmp_path / "state" / "state.json"
+    monkeypatch.setenv("LESVI_STATE", str(state_file))
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf))  # no state attached
+
+    updated = index.set_pin("shelf", "lessons/0001-alpha.html", True)
+
+    assert updated.by_number("shelf")[0].pinned is True
+    assert PinState.load(state_file).pins == {"shelf/lessons/0001-alpha.html"}
+
+
+def test_changed_self_heals_a_pin_decided_after_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The watcher holds a stale snapshot while the server toggles pins."""
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0002-beta.html", "<p>b</p>")
+    state_file = tmp_path / "state.json"
+    state = PinState.load(state_file)
+    stale = Index.build(_shelf_config(tmp_path, shelf=shelf), state)
+    # The server records a decision against its own snapshot...
+    updated = stale.set_pin("shelf", "lessons/0001-alpha.html", True)
+    assert [artifact.path for artifact in updated.pinned()] == [
+        "lessons/0001-alpha.html"
+    ]
+
+    # ...and the watcher, still on the pre-toggle snapshot, rebuilds the shelf.
+    beta = next(item for item in stale.artifacts if item.path.endswith("beta.html"))
+    healed = stale.changed("shelf", upsert=[replace(beta, title="Beta, revised")])
+
+    pins = {artifact.path: artifact.pinned for artifact in healed.by_number("shelf")}
+    assert pins == {"lessons/0001-alpha.html": True, "lessons/0002-beta.html": False}
+    assert healed.pinned()[0].path == "lessons/0001-alpha.html"
 
 
 # --- incremental updates (issue #10) ------------------------------------------

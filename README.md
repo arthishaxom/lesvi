@@ -67,14 +67,18 @@ uv run lesvi serve --poll-interval 5   # force mtime polling every 5s
 ```
 
 `serve` scans every registered shelf into an in-memory index, renders the
-virtual dashboards (`/` recency feed, `/s/<shelf>/` curriculum order with a
-`?sort=recent` toggle; Research stays hidden in v1), and serves the index at
-`/api/index.json` (`Cache-Control: no-store`, gzipped when the client accepts
-it). Each indexed artifact and its relative assets are served byte-for-byte at
-`/a/<shelf>/<path>` with `ETag`/`Last-Modified` revalidation. The UI assets
-(`/assets/app.css`, `/assets/app.js`) add the persisted theme toggle; pages
-read fine with JavaScript disabled. Search, the pin toggle and auth land with
-their feature tickets.
+virtual dashboards (`/` pinned section + recency feed, `/s/<shelf>/` curriculum
+order with a `?sort=recent` toggle; Research stays hidden in v1), and serves the
+index at `/api/index.json` (`Cache-Control: no-store`, gzipped when the client
+accepts it). Every page carries an instant client-side search over
+title/description/tags; the query persists in `?q=`, so a reload or a shared
+URL reopens the same filtered view with the result count announced. Cards also
+carry a pin toggle: it updates optimistically and stores the decision through
+`POST /api/pin` (`{"shelf", "path", "pinned"}` → `204`). Each indexed artifact
+and its relative assets are served byte-for-byte at `/a/<shelf>/<path>` with
+`ETag`/`Last-Modified` revalidation. The UI assets (`/assets/app.css`,
+`/assets/app.js`) add the persisted theme toggle; pages read fine with
+JavaScript disabled. Auth lands with its feature ticket.
 
 The index keeps itself current while `serve` runs: writing, overwriting,
 renaming or deleting a lesson (or its `.meta.json` sidecar) updates the feed
@@ -115,7 +119,10 @@ either override replaces the whole tag list, and `"tags": []` clears it
 entirely. `number` always comes from the `NNNN` filename. `pin` only *seeds* the
 server-side pin: once you toggle that card, your choice wins over the
 declaration. Pins live in `~/.local/state/lesvi/state.json` (`$LESVI_STATE`) —
-never in a shelf folder. Broken sidecars or unusable meta tags are ignored field
+never in a shelf folder — and survive restarts. The card's pin toggle writes
+them through `POST /api/pin` (JSON only, same-origin; the content type is what
+keeps other sites out without a CORS preflight), and Home's pinned section
+follows without a restart. Broken sidecars or unusable meta tags are ignored field
 by field (logged at debug level), so the artifact keeps indexing.
 
 ## Status

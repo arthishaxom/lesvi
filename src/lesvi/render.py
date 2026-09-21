@@ -19,6 +19,9 @@ HOME_PAGE_SIZE = 50
 MAX_HOME_LIMIT = 500
 RECENT_SORT = "recent"
 
+#: Shown by the script when a search leaves no card standing; hidden without JS.
+NO_RESULTS = '<p class="no-results" hidden>No artifacts match your search.</p>'
+
 _STYLESHEET = "/assets/app.css"
 _SCRIPT = "/assets/app.js"
 _THEME_BOOT = (
@@ -113,6 +116,7 @@ def render_home(
             "<code>lesvi add &lt;path&gt;</code>.</p>"
             "</section>"
         )
+    main.append(NO_RESULTS)
     main.append("</main>")
 
     return _document(title="lesvi", index=index, active=None, main="".join(main))
@@ -159,6 +163,7 @@ def render_shelf(
         )
     if not rendered_any:
         main.append('<p class="empty">No visible artifacts in this shelf yet.</p>')
+    main.append(NO_RESULTS)
     main.append("</main>")
 
     title = f"{shelf.title} · lesvi"
@@ -208,16 +213,36 @@ def _card(artifact: Artifact, now: datetime | None) -> str:
         tags = f'<ul class="card-tags">{items}</ul>'
     moment = _esc(artifact.mtime)
     return (
-        '<li class="card-item"><article class="card">'
+        '<li class="card-item">'
+        f'<article class="card" data-search="{_search_text(artifact)}">'
         '<p class="card-meta">'
         f'<span class="card-shelf">{_esc(artifact.shelf)}</span>'
-        f"{number}</p>"
+        f"{number}{_pin_toggle(artifact)}</p>"
         f'<h3 class="card-title"><a class="card-link" href="{_esc(artifact.url)}">'
         f"{_esc(artifact.title)}</a></h3>"
         f"{description}{tags}"
         f'<time class="card-time" datetime="{moment}" title="{moment}">'
         f"{_esc(relative_time(artifact.mtime, now))}</time>"
         "</article></li>"
+    )
+
+
+def _search_text(artifact: Artifact) -> str:
+    """The card text client-side search matches on: title, description, tags."""
+    return _esc(" ".join((artifact.title, artifact.description, *artifact.tags)))
+
+
+def _pin_toggle(artifact: Artifact) -> str:
+    """The per-card pin button; hidden until the script wires it up."""
+    action = "Unpin" if artifact.pinned else "Pin"
+    return (
+        '<button class="pin-toggle" type="button" hidden'
+        f' data-shelf="{_esc(artifact.shelf)}"'
+        f' data-path="{_esc(artifact.path)}"'
+        f' aria-pressed="{"true" if artifact.pinned else "false"}"'
+        f' aria-label="{_esc(f"{action} {artifact.title}")}">'
+        f'<span class="pin-glyph" aria-hidden="true">'
+        f"{'★' if artifact.pinned else '☆'}</span></button>"
     )
 
 
@@ -245,6 +270,8 @@ def _document(*, title: str, index: Index, active: str | None, main: str) -> str
         '<a class="skip-link" href="#main">Skip to content</a>\n'
         f"{_header(index, active)}\n"
         f"{main}\n"
+        '<p class="pin-status visually-hidden" id="pin-status" role="status"'
+        ' aria-live="polite"></p>\n'
         "</body>\n"
         "</html>\n"
     )
@@ -271,7 +298,21 @@ def _header(index: Index, active: str | None) -> str:
         '<button class="theme-toggle" type="button" hidden>Dark mode</button>'
         "</div>"
         f"{nav}"
+        f"{_search()}"
         "</header>"
+    )
+
+
+def _search() -> str:
+    """The client-side search box; hidden until the script takes it over."""
+    return (
+        '<form class="search" role="search" method="get" action="" hidden>'
+        '<label class="visually-hidden" for="search-input">Search artifacts</label>'
+        '<input class="search-input" id="search-input" type="search" name="q"'
+        ' placeholder="Search title, description, tags" autocomplete="off"'
+        ' spellcheck="false">'
+        '<p class="search-count" id="search-count" role="status"'
+        ' aria-live="polite"></p></form>'
     )
 
 

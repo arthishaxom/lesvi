@@ -8,6 +8,7 @@ about the template's formatting.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -66,6 +67,12 @@ class PageCard:
     tags: list[str] = field(default_factory=list)
     time: str = ""
     datetime: str = ""
+    search: str = ""
+    pin_pressed: bool = False
+    pin_shelf: str = ""
+    pin_path: str = ""
+    pin_label: str = ""
+    pin_hidden: bool = False
 
 
 @dataclass
@@ -105,7 +112,13 @@ class _PageParser(HTMLParser):
         element = _Element(tag=tag, classes=classes)
         card = self._open_card()
         if tag == "article" and "card" in classes:
-            element.card = PageCard()
+            element.card = PageCard(search=attributes.get("data-search") or "")
+        if card is not None and tag == "button" and "pin-toggle" in classes:
+            card.pin_pressed = attributes.get("aria-pressed") == "true"
+            card.pin_shelf = attributes.get("data-shelf") or ""
+            card.pin_path = attributes.get("data-path") or ""
+            card.pin_label = attributes.get("aria-label") or ""
+            card.pin_hidden = "hidden" in attributes
         if tag in ("h1", "h2", "h3") and card is None:
             element.heading = PageHeading(int(tag[1]), "")
         href = attributes.get("href")
@@ -321,6 +334,56 @@ def test_home_card_carries_shelf_number_title_description_tags_and_time(
     )
 
 
+def test_cards_carry_the_search_text_and_a_hidden_pin_toggle(index: Index) -> None:
+    kafka = parse_page(render_home(index, now=NOW)).cards[1]
+
+    assert "Apache Kafka Fundamentals" in kafka.search
+    assert "Topics, partitions and consumer groups." in kafka.search
+    assert "Track B" in kafka.search
+    assert kafka.pin_pressed is False
+    assert kafka.pin_shelf == "data-engg"
+    assert kafka.pin_path == "lessons/0024-apache-kafka-fundamentals.html"
+    assert kafka.pin_label == "Pin Apache Kafka Fundamentals"
+    assert kafka.pin_hidden is True  # revealed by app.js
+
+
+def test_a_seeded_pin_renders_a_pressed_unpin_toggle(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(
+        shelf,
+        "lessons/0001-alpha.html",
+        "<title>Alpha</title>",
+        moments_ago=timedelta(minutes=1),
+    )
+    (shelf / "lessons" / "0001-alpha.html.meta.json").write_text('{"pin": true}')
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(f'[shelves.shelf]\npath = "{shelf}"\n')
+    index = Index.build(Config.load(config_file))
+
+    card = parse_page(render_home(index, now=NOW)).cards[0]
+
+    assert card.pin_pressed is True
+    assert card.pin_label == "Unpin Alpha"
+
+
+def test_both_pages_carry_a_hidden_search_box_and_a_live_result_count(
+    index: Index,
+) -> None:
+    rendered_pages = (
+        render_home(index, now=NOW),
+        render_shelf(index, "data-engg", now=NOW),
+    )
+
+    for rendered in rendered_pages:
+        assert re.search(r'<form class="search"[^>]*hidden', rendered)
+        assert 'name="q"' in rendered
+        assert 'type="search"' in rendered
+        assert 'for="search-input"' in rendered
+        assert 'id="search-input"' in rendered
+        assert 'role="status" aria-live="polite"' in rendered
+        assert 'class="no-results" hidden' in rendered
+
+
 def test_cards_without_a_number_omit_the_badge(index: Index) -> None:
     cheatsheet = parse_page(render_home(index, now=NOW)).cards[2]
 
@@ -430,6 +493,35 @@ def test_shelf_page_orders_cards_by_curriculum_number(index: Index) -> None:
         "/a/data-engg/lessons/0024-apache-kafka-fundamentals.html",
         "/a/data-engg/reference/kafka-cheatsheet.html",
     ]
+
+
+def test_shelf_page_cards_carry_the_same_search_and_pin_hooks(index: Index) -> None:
+    card = parse_page(render_shelf(index, "data-engg", now=NOW)).cards[0]
+
+    assert "Glossary" in card.search
+    assert card.pin_shelf == "data-engg"
+    assert card.pin_path == "lessons/0005-glossary.html"
+    assert card.pin_hidden is True
+
+
+def test_card_search_and_pin_attributes_escape_metadata(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(
+        shelf,
+        'lessons/0001-a"b.html',
+        "<title>Lesson 1 — A &quot;quoted&quot; title</title>"
+        '<p class="subtitle">Say &quot;hi&quot;.</p>',
+        moments_ago=timedelta(minutes=1),
+    )
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(f'[shelves.shelf]\npath = "{shelf}"\n')
+    index = Index.build(Config.load(config_file))
+
+    card = parse_page(render_home(index, now=NOW)).cards[0]
+
+    assert card.search == 'A "quoted" title Say "hi". Lessons'
+    assert card.pin_path == 'lessons/0001-a"b.html'
+    assert card.pin_label == 'Pin A "quoted" title'
 
 
 def test_shelf_page_recent_sort_orders_each_section_by_mtime(index: Index) -> None:

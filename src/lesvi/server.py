@@ -14,11 +14,12 @@ import json
 import logging
 import os
 import stat
+import threading
 from datetime import UTC
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from lesvi import __version__
@@ -37,8 +38,11 @@ log = logging.getLogger(__name__)
 ARTIFACT_PREFIX = "/a/"
 SHELF_PREFIX = "/s/"
 ASSET_PREFIX = "/assets/"
+PIN_PATH = "/api/pin"
 CHUNK_SIZE = 64 * 1024
 OCTET_STREAM = "application/octet-stream"
+#: A pin payload is three short fields; anything larger is not one we should read.
+PIN_BODY_LIMIT = 64 * 1024
 
 UI_ASSETS: dict[str, str] = {
     "app.css": "text/css; charset=utf-8",
@@ -75,15 +79,33 @@ class LesviServer(ThreadingHTTPServer):
 
     daemon_threads: bool = True
     index: Index
+    #: Serialises index swaps: a pin write and a watcher publish must not
+    #: interleave, or one snapshot would clobber the other's work.
+    index_lock: threading.Lock
 
     def __init__(self, address: tuple[str, int], index: Index) -> None:
         super().__init__(address, LesviRequestHandler)
         self.index = index
+        self.index_lock = threading.Lock()
+
+    def set_index(self, index: Index) -> None:
+        """Swap in a fresh snapshot, healing its pin decisions first.
+
+        A watcher builds from a snapshot that can predate a pin recorded on
+        the served index, so every swap re-resolves pins against the served
+        state before taking effect. Returns only once the swap is visible.
+        """
+        with self.index_lock:
+            state = self.index.state if self.index.state is not None else index.state
+            self.index = index.with_pins(state)
 
 
 class LesviRequestHandler(BaseHTTPRequestHandler):
     server_version: str = f"lesvi/{__version__}"
     protocol_version: str = "HTTP/1.1"
+    #: A stalled client must not hold a handler thread forever (slow headers
+    #: or a half-sent body); the stdlib closes the connection on a timeout.
+    timeout: ClassVar[float | None] = 30
     # Declared upstream; annotated here so basedpyright accepts the assignments
     # that drop keep-alive when a response cannot be completed in full.
     close_connection: bool
@@ -98,26 +120,34 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._handle(include_body=False)
 
+    def do_POST(self) -> None:
+        self._handle(include_body=False, post=True)
+
     def log_message(self, format: str, *args: object) -> None:
         log.info("%s - %s", self.address_string(), format % args)
 
-    def _handle(self, *, include_body: bool) -> None:
+    def _handle(self, *, include_body: bool, post: bool = False) -> None:
         try:
-            self._respond(include_body=include_body)
+            self._respond(include_body=include_body, post=post)
         except OSError:
             # The client vanished mid-response (cancelled load, flaky mobile
             # network): nobody is left to send a 500 to.
             log.debug("client disconnected during %s", self.path, exc_info=True)
             self.close_connection = True
 
-    def _respond(self, *, include_body: bool) -> None:
+    def _respond(self, *, include_body: bool, post: bool = False) -> None:
         try:
             target = urlsplit(self.path)
         except ValueError:  # absolute-form target with a malformed IPv6 authority
             self.send_error(400, "bad request target")
             return
         path = target.path
-        if path == "/api/index.json":
+        if post:
+            if path == PIN_PATH:
+                self._set_pin()
+            else:
+                self.send_error(404, "not found")
+        elif path == "/api/index.json":
             self._send_index(include_body=include_body)
         elif path.startswith(ARTIFACT_PREFIX):
             self._serve_artifact(path, include_body=include_body)
@@ -201,6 +231,83 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if include_body:
             self.wfile.write(body)
+
+    def _set_pin(self) -> None:
+        """``POST /api/pin``: record a decision, persist it, swap the index.
+
+        The response is ``204`` only after both the state file and the served
+        index reflect the decision, so a refresh — or a restart — agrees.
+        """
+        if not self._pin_request_allowed():
+            return
+        payload = self._read_pin_payload()
+        if payload is None:
+            self.send_error(400, "invalid pin payload")
+            return
+        shelf, path, pinned = payload
+        server = cast(LesviServer, self.server)
+        try:
+            with server.index_lock:
+                server.index = server.index.set_pin(shelf, path, pinned)
+        except KeyError:
+            self.send_error(404, "unknown artifact")
+            return
+        except OSError:
+            log.exception("cannot save the pin state file")
+            self.send_error(500, "cannot save pin state")
+            return
+        self.send_response(204)
+        self.end_headers()
+
+    def _pin_request_allowed(self) -> bool:
+        """Whether this looks like the UI's own JSON fetch, not a cross-site post.
+
+        A page on another origin cannot send ``application/json`` without a
+        CORS preflight, so requiring it keeps the endpoint out of CSRF reach;
+        the ``Sec-Fetch-Site`` check (browsers only; absent for scripts)
+        refuses what would slip through as a same-site request.
+        """
+        media_type = self.headers.get("Content-Type", "")
+        if media_type.split(";", 1)[0].strip().lower() != "application/json":
+            # The body is left unread, so this connection cannot be reused.
+            self.close_connection = True
+            self.send_error(415, "pin payload must be application/json")
+            return False
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None and site not in ("same-origin", "none"):
+            self.close_connection = True
+            self.send_error(403, "cross-site pin request refused")
+            return False
+        return True
+
+    def _read_pin_payload(self) -> tuple[str, str, bool] | None:
+        """The ``(shelf, path, pinned)`` triple in the request body, or None."""
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else 0
+        except ValueError:
+            self.close_connection = True
+            return None
+        if not 0 < length <= PIN_BODY_LIMIT:
+            # Refusing without draining the body would desync keep-alive.
+            self.close_connection = True
+            return None
+        try:
+            data = json.loads(self.rfile.read(length))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        shelf = data.get("shelf")
+        path = data.get("path")
+        pinned = data.get("pinned")
+        if not isinstance(shelf, str) or not shelf:
+            return None
+        if not isinstance(path, str) or not path:
+            return None
+        if not isinstance(pinned, bool):
+            return None
+        return shelf, path, pinned
 
     def _serve_artifact(self, path: str, *, include_body: bool) -> None:
         resolved = _resolve_artifact(self.index, path)

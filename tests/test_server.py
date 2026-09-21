@@ -23,6 +23,7 @@ import pytest
 from lesvi.config import Config, resolve_path
 from lesvi.index import Index
 from lesvi.server import LesviServer, make_server
+from lesvi.state import PinState
 
 LESSON_PATH = "lessons/0024-apache-kafka-fundamentals.html"
 LESSON_BYTES = (
@@ -104,6 +105,14 @@ def index(config: Config) -> Index:
     return Index.build(config)
 
 
+@pytest.fixture(autouse=True)
+def pin_state_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep every test's pin store in tmp_path, never the real one."""
+    path = tmp_path / "state.json"
+    monkeypatch.setenv("LESVI_STATE", str(path))
+    return path
+
+
 @pytest.fixture
 def server(index: Index) -> Iterator[LesviServer]:
     server = make_server(index, "127.0.0.1", 0)
@@ -129,11 +138,28 @@ def _get(
 
 
 def _request(
-    server_address: tuple[str, int], method: str, path: str, **headers: str
+    server_address: tuple[str, int],
+    method: str,
+    path: str,
+    *,
+    body: bytes | str | None = None,
+    **headers: str,
 ) -> http.client.HTTPResponse:
     connection = http.client.HTTPConnection(*server_address, timeout=5)
-    connection.request(method, path, headers=headers)
+    connection.request(method, path, body=body, headers=headers)
     return connection.getresponse()
+
+
+def _post(
+    server_address: tuple[str, int], path: str, payload: object
+) -> http.client.HTTPResponse:
+    return _request(
+        server_address,
+        "POST",
+        path,
+        body=json.dumps(payload).encode(),
+        **{"Content-Type": "application/json"},
+    )
 
 
 def _etag_and_modified(server_address: tuple[str, int]) -> tuple[str, str]:
@@ -428,6 +454,253 @@ def test_pages_carry_the_ui_assets_and_the_theme_boot(
     )
     assert '<main id="main"' in body
     assert 'class="skip-link"' in body
+
+
+# --- the pin API (issue #7) ---------------------------------------------------
+
+
+def test_post_pin_records_the_decision_and_returns_204(
+    server_address: tuple[str, int], pin_state_file: Path
+) -> None:
+    response = _post(
+        server_address,
+        "/api/pin",
+        {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True},
+    )
+
+    assert response.status == 204
+    assert response.read() == b""
+    record = next(
+        item
+        for item in json.loads(_get(server_address, "/api/index.json").read())[
+            "artifacts"
+        ]
+        if item["path"] == LESSON_PATH
+    )
+    assert record["pinned"] is True
+    assert json.loads(pin_state_file.read_text())["pins"] == [
+        f"data-engg/{LESSON_PATH}"
+    ]
+
+
+def test_pinning_puts_the_card_in_homes_pinned_section(
+    server_address: tuple[str, int],
+) -> None:
+    _post(
+        server_address,
+        "/api/pin",
+        {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True},
+    ).read()
+
+    body = _get(server_address, "/").read().decode()
+
+    assert "Pinned" in body
+    # The pinned card leads the page and stays out of the recent feed.
+    assert _artifact_hrefs(body)[0] == f"/a/data-engg/{LESSON_PATH}"
+    assert _artifact_hrefs(body).count(f"/a/data-engg/{LESSON_PATH}") == 1
+
+
+def test_a_pin_survives_a_server_restart(
+    config: Config,
+    server: LesviServer,
+    server_address: tuple[str, int],
+    pin_state_file: Path,
+) -> None:
+    _post(
+        server_address,
+        "/api/pin",
+        {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True},
+    ).read()
+
+    # A restart is a fresh index built from the same on-disk state file.
+    server.index = Index.build(config, PinState.load(pin_state_file))
+    body = _get(server_address, "/").read().decode()
+
+    assert "Pinned" in body
+    assert _artifact_hrefs(body)[0] == f"/a/data-engg/{LESSON_PATH}"
+
+
+def test_an_explicit_unpin_beats_a_declared_seed_across_a_restart(
+    shelf: Path, config: Config, server: LesviServer, server_address: tuple[str, int]
+) -> None:
+    _write(shelf, f"{LESSON_PATH}.meta.json", '{"pin": true}')
+    server.index = Index.build(config)  # the sidecar seeds the pin
+    assert (
+        _artifact_hrefs(_get(server_address, "/").read().decode())[0]
+        == f"/a/data-engg/{LESSON_PATH}"
+    )
+
+    response = _post(
+        server_address,
+        "/api/pin",
+        {"shelf": "data-engg", "path": LESSON_PATH, "pinned": False},
+    )
+    restarted = Index.build(config, PinState.load())
+
+    assert response.status == 204
+    assert response.read() == b""
+    assert restarted.by_number("data-engg")[0].pinned is False
+    assert "Pinned" not in _get(server_address, "/").read().decode()
+
+
+def test_a_watcher_publish_cannot_lose_a_pin(
+    config: Config, server: LesviServer, server_address: tuple[str, int]
+) -> None:
+    _post(
+        server_address,
+        "/api/pin",
+        {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True},
+    ).read()
+
+    # The watcher publishes a snapshot it built before the pin landed.
+    server.set_index(Index.build(config))
+
+    payload = json.loads(_get(server_address, "/api/index.json").read())
+    record = next(item for item in payload["artifacts"] if item["path"] == LESSON_PATH)
+    assert record["pinned"] is True
+    assert "Pinned" in _get(server_address, "/").read().decode()
+
+
+def test_a_pin_request_must_be_json(
+    server_address: tuple[str, int], pin_state_file: Path
+) -> None:
+    response = _request(
+        server_address,
+        "POST",
+        "/api/pin",
+        body=b'{"shelf":"data-engg","path":"x","pinned":true}',
+        **{"Content-Type": "text/plain"},
+    )
+
+    assert response.status == 415
+    response.read()
+    assert not pin_state_file.exists()
+
+
+def test_a_cross_site_pin_request_is_refused(
+    server_address: tuple[str, int], pin_state_file: Path
+) -> None:
+    response = _request(
+        server_address,
+        "POST",
+        "/api/pin",
+        body=json.dumps(
+            {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True}
+        ).encode(),
+        **{
+            "Content-Type": "application/json",
+            "Sec-Fetch-Site": "cross-site",
+        },
+    )
+
+    assert response.status == 403
+    response.read()
+    assert not pin_state_file.exists()
+
+
+def test_valid_pin_requests_keep_the_connection_alive(
+    server_address: tuple[str, int],
+) -> None:
+    connection = http.client.HTTPConnection(*server_address, timeout=5)
+    try:
+        for pinned in (True, False):
+            connection.request(
+                "POST",
+                "/api/pin",
+                body=json.dumps(
+                    {"shelf": "data-engg", "path": LESSON_PATH, "pinned": pinned}
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            assert response.status == 204
+            assert response.read() == b""
+    finally:
+        connection.close()
+
+
+def test_a_pin_for_an_unknown_artifact_is_a_404(
+    server_address: tuple[str, int], pin_state_file: Path
+) -> None:
+    for shelf, path in (
+        ("data-engg", "lessons/missing.html"),
+        ("ghost", LESSON_PATH),
+    ):
+        response = _post(
+            server_address, "/api/pin", {"shelf": shelf, "path": path, "pinned": True}
+        )
+        assert response.status == 404, (shelf, path)
+        assert response.read()
+
+    assert not pin_state_file.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"shelf": "data-engg", "path": LESSON_PATH},
+        {"shelf": "data-engg", "path": LESSON_PATH, "pinned": "yes"},
+        {"shelf": 5, "path": LESSON_PATH, "pinned": True},
+        {"shelf": "", "path": "", "pinned": True},
+        [1, 2, 3],
+    ],
+)
+def test_a_malformed_pin_payload_is_a_400(
+    server_address: tuple[str, int], pin_state_file: Path, payload: object
+) -> None:
+    response = _post(server_address, "/api/pin", payload)
+
+    assert response.status == 400
+    assert response.read()
+    assert not pin_state_file.exists()
+
+
+def test_an_oversized_or_empty_pin_body_is_a_400(
+    server_address: tuple[str, int],
+) -> None:
+    oversized = _request(
+        server_address,
+        "POST",
+        "/api/pin",
+        body=b"x" * (256 * 1024),
+        **{"Content-Type": "application/json; charset=utf-8"},
+    )
+    empty = _request(
+        server_address,
+        "POST",
+        "/api/pin",
+        body=b"",
+        **{"Content-Type": "application/json"},
+    )
+
+    assert oversized.status == 400
+    assert oversized.read()
+    assert empty.status == 400
+    assert empty.read()
+
+
+def test_post_to_an_unknown_path_is_a_404(server_address: tuple[str, int]) -> None:
+    response = _post(server_address, "/api/nope", {})
+
+    assert response.status == 404
+    assert response.read()
+
+
+def test_toggling_a_pin_never_writes_into_the_shelf(
+    shelf: Path, server_address: tuple[str, int]
+) -> None:
+    before = _sweep(shelf)
+
+    for pinned in (True, False, True):
+        response = _post(
+            server_address,
+            "/api/pin",
+            {"shelf": "data-engg", "path": LESSON_PATH, "pinned": pinned},
+        )
+        assert response.status == 204
+        response.read()
+
+    assert _sweep(shelf) == before
 
 
 # --- raw artifacts: bytes, assets and content types ---------------------------

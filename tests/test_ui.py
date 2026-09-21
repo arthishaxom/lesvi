@@ -69,7 +69,15 @@ def test_theme_text_pairs_meet_aa_contrast(theme: str, block: str) -> None:
 
 @pytest.mark.parametrize(
     "selector",
-    [".brand", ".theme-toggle", ".shelf-link", ".sort-link", ".show-more a"],
+    [
+        ".brand",
+        ".theme-toggle",
+        ".shelf-link",
+        ".sort-link",
+        ".show-more a",
+        ".search-input",
+        ".pin-toggle",
+    ],
 )
 def test_interactive_controls_declare_a_44px_minimum(selector: str) -> None:
     assert "min-height: 44px" in _rule(CSS, selector)
@@ -91,3 +99,27 @@ def test_the_script_persists_the_choice_and_follows_the_system() -> None:
     assert "dataset.theme" in JS
     assert "matchMedia" in JS
     assert 'addEventListener("change"' in JS
+
+
+def test_the_script_searches_client_side_and_persists_the_query() -> None:
+    assert "SEARCH_DEBOUNCE_MS = 100" in JS
+    assert "dataset.search" in JS
+    assert "URLSearchParams" in JS
+    assert "history.replaceState" in JS
+    assert "search-count" in JS
+    assert '"1 result"' in JS or "1 result" in JS
+    assert "preventDefault" in JS  # Enter keeps sort/limit instead of navigating
+    assert "syncSamePageLinks" in JS  # sort and "Show more" keep ?q=
+
+
+def test_the_script_toggles_pins_optimistically_and_posts_them() -> None:
+    assert 'fetch("/api/pin"' in JS
+    assert '"POST"' in JS
+    assert "aria-pressed" in JS
+    assert "pinned:" in JS
+    assert "pin-status" in JS
+
+
+def test_the_search_box_is_hidden_until_the_script_takes_over() -> None:
+    assert ".search[hidden]" in CSS
+    assert "display: none" in _rule(CSS, ".search[hidden]")
