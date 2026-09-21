@@ -1,7 +1,7 @@
 """Command-line surface for lesvi.
 
-``version``, ``add``, ``list``, ``remove``, ``serve``, ``status`` and
-``service`` exist so far; ``url`` remains and lands with its feature ticket.
+``version``, ``add``, ``list``, ``remove``, ``serve``, ``url``, ``status`` and
+``service`` are the v1 commands.
 """
 
 from __future__ import annotations
@@ -12,8 +12,10 @@ import json
 import logging
 import math
 import sys
-from collections.abc import Callable
+import webbrowser
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from lesvi import __version__, service
 from lesvi.auth import Auth, resolve_token
@@ -29,7 +31,8 @@ from lesvi.config import (
     slugify,
     validate_host,
 )
-from lesvi.index import Index
+from lesvi.index import Index, Shelf
+from lesvi.scanner import Artifact
 from lesvi.server import make_server
 from lesvi.state import PinState
 from lesvi.watch import Watcher
@@ -195,6 +198,111 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for entry in entries:
         print(f"{entry['name']}  {entry['path']}  {_category_detail(entry)}")
     return 0
+
+
+def _cmd_url(args: argparse.Namespace) -> int:
+    """Print the URL for the home page, a shelf page, or one artifact.
+
+    Artifacts resolve by ``NNNN`` number, slug substring, or exact relative
+    path. The public URL is used when ``public_url`` is configured, so the
+    printed link is the one to open on a phone; ``--open`` launches it in the
+    browser on this machine.
+    """
+    config = Config.load(Path(args.config).expanduser() if args.config else None)
+    index = Index.build(config)
+    route = "/"
+    if args.shelf is not None:
+        shelf = index.shelves.get(args.shelf)
+        if shelf is None:
+            registered = ", ".join(index.shelves) or "none"
+            raise ConfigError(
+                f"no shelf named {args.shelf!r}; registered shelves: {registered}"
+            )
+        route = f"/s/{quote(shelf.name, safe='')}/"
+        if args.artifact is not None:
+            if not args.artifact:
+                raise ConfigError("artifact lookup needs a number, slug, or path")
+            route = _artifact_route(index, shelf, unquote(args.artifact))
+    url = _base_url(config) + route
+    print(url)
+    if args.open:
+        _open_browser(url)
+    return 0
+
+
+def _artifact_route(index: Index, shelf: Shelf, needle: str) -> str:
+    """The ``/a/…`` route for the one visible artifact *needle* names, or an error."""
+    visible = tuple(
+        artifact
+        for artifact in index.visible_artifacts
+        if artifact.shelf == shelf.name
+    )
+    matches = _match_artifacts(visible, needle)
+    if not matches:
+        visible_paths = {artifact.path for artifact in visible}
+        hidden = [
+            artifact
+            for artifact in shelf.curriculum
+            if artifact.path not in visible_paths
+            and _match_artifacts((artifact,), needle)
+        ]
+        if hidden:
+            raise ConfigError(
+                f"artifact {hidden[0].path!r} in shelf {shelf.name!r} is hidden; "
+                "research rendering is parked for v2"
+            )
+        raise ConfigError(f"no artifact matching {needle!r} in shelf {shelf.name!r}")
+    if len(matches) > 1:
+        listing = "\n  ".join(artifact.path for artifact in matches)
+        raise ConfigError(
+            f"{len(matches)} artifacts match {needle!r} in shelf {shelf.name!r}:"
+            f"\n  {listing}\npass the NNNN or the exact relative path"
+        )
+    return matches[0].url
+
+
+def _match_artifacts(records: Iterable[Artifact], needle: str) -> list[Artifact]:
+    """Resolve *needle*: exact path, else ``NNNN``, else slug substring."""
+    exact = [artifact for artifact in records if artifact.path == needle]
+    if exact:
+        return exact
+    if needle.isascii() and needle.isdigit():
+        numbered = [
+            artifact for artifact in records if artifact.number == int(needle)
+        ]
+        if numbered:
+            return numbered
+    wanted = needle.lower()
+    return [artifact for artifact in records if wanted in artifact.path.lower()]
+
+
+def _base_url(config: Config) -> str:
+    """The public base URL when configured, else the local browse URL."""
+    public = config.public_url().rstrip("/")
+    if public:
+        return public
+    return f"http://{_browse_host(config.host())}:{config.port()}"
+
+
+def _browse_host(host: str) -> str:
+    """A host fit for a URL: a wildcard bind browses on loopback, IPv6 brackets."""
+    bare = host.strip("[]")
+    if bare in ("0.0.0.0", "::"):
+        return "127.0.0.1"
+    if ":" in bare:
+        # A zone id's percent must be escaped to survive URL parsing.
+        return f"[{bare.replace('%', '%25')}]"
+    return bare
+
+
+def _open_browser(url: str) -> None:
+    """Launch *url* locally; a missing browser is an error, not a crash."""
+    try:
+        opened = webbrowser.open(url)
+    except webbrowser.Error as exc:
+        raise ConfigError(f"could not open a browser: {exc}") from exc
+    if not opened:
+        raise ConfigError("could not open a browser; the URL is printed above")
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -424,6 +532,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="machine-readable output"
     )
     list_parser.set_defaults(handler=_cmd_list)
+
+    url_parser = subparsers.add_parser(
+        "url", help="print the URL for the home page, a shelf, or an artifact"
+    )
+    url_parser.add_argument(
+        "shelf", nargs="?", help="shelf name (default: the home page)"
+    )
+    url_parser.add_argument(
+        "artifact",
+        nargs="?",
+        help="NNNN number, slug substring, or exact relative path",
+    )
+    url_parser.add_argument(
+        "--open", action="store_true", help="open the printed URL in the browser"
+    )
+    url_parser.add_argument("--config", help="config file (default $LESVI_CONFIG)")
+    url_parser.set_defaults(handler=_cmd_url)
 
     remove_parser = subparsers.add_parser("remove", help="forget a registered shelf")
     remove_parser.add_argument("target", help="shelf name or path")

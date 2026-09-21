@@ -480,6 +480,80 @@ def test_pages_carry_the_ui_assets_and_the_theme_boot(
     assert 'class="skip-link"' in body
 
 
+# --- the PWA surface (issue #11) ----------------------------------------------
+
+
+def test_the_manifest_declares_an_installable_standalone_app(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/manifest.webmanifest")
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "application/manifest+json"
+    payload = json.loads(response.read())
+    assert payload["name"] == "lesvi"
+    assert payload["short_name"] == "lesvi"
+    assert payload["display"] == "standalone"
+    assert payload["start_url"] == "/"
+    assert payload["scope"] == "/"
+    assert payload["background_color"].startswith("#")
+    assert payload["theme_color"].startswith("#")
+    sizes = {icon["sizes"] for icon in payload["icons"]}
+    assert {"192x192", "512x512"} <= sizes
+    assert any("maskable" in icon.get("purpose", "") for icon in payload["icons"])
+
+
+def test_the_service_worker_serves_from_the_root_and_revalidates(
+    server_address: tuple[str, int],
+) -> None:
+    response = _get(server_address, "/sw.js")
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/javascript; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-cache"
+    assert response.read()
+
+
+@pytest.mark.parametrize(
+    ("path", "size"),
+    [
+        ("/assets/icon-192.png", 192),
+        ("/assets/icon-512.png", 512),
+        ("/assets/icon-maskable-512.png", 512),
+    ],
+)
+def test_pwa_icons_are_pngs_of_the_declared_size(
+    server_address: tuple[str, int], path: str, size: int
+) -> None:
+    response = _get(server_address, path)
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "image/png"
+    data = response.read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", data[16:24]) == (size, size)
+
+
+def test_the_favicon_is_a_real_ico(server_address: tuple[str, int]) -> None:
+    response = _get(server_address, "/favicon.ico")
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "image/x-icon"
+    reserved, kind, count = struct.unpack("<HHH", response.read()[:6])
+    assert (reserved, kind, count) == (0, 1, 1)
+
+
+def test_pages_link_the_manifest_icons_and_theme_colors(
+    server_address: tuple[str, int],
+) -> None:
+    body = _get(server_address, "/").read().decode()
+
+    assert '<link rel="manifest" href="/manifest.webmanifest">' in body
+    assert '<link rel="icon" href="/assets/icon-192.png" type="image/png">' in body
+    assert '<link rel="apple-touch-icon" href="/assets/icon-192.png">' in body
+    assert 'name="theme-color"' in body
+
+
 # --- the pin API (issue #7) ---------------------------------------------------
 
 
@@ -1411,15 +1485,16 @@ def test_login_without_a_configured_token_goes_straight_home(
 def test_exempt_paths_skip_the_login_redirect(
     authed_address: tuple[str, int],
 ) -> None:
-    for path in ("/login", "/healthz", "/assets/app.css"):
+    for path in (
+        "/login",
+        "/healthz",
+        "/assets/app.css",
+        "/manifest.webmanifest",
+        "/sw.js",
+        "/favicon.ico",
+    ):
         response = _get(authed_address, path, **TUNNELED)
         assert response.status == 200, path
-        response.read()
-
-    # Not implemented yet (PWA ticket #11), but never behind the login either.
-    for path in ("/manifest.webmanifest", "/sw.js", "/favicon.ico"):
-        response = _get(authed_address, path, **TUNNELED)
-        assert response.status == 404, path
         assert response.getheader("Location") is None, path
         response.read()
 

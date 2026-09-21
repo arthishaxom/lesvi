@@ -45,7 +45,30 @@ Free tier: Access is free for teams under 50 users; one human = one seat. Servic
 
 1. Open `https://lesvi.yourdomain.com` on the phone → complete the Access login → lesvi home.
 2. Install as PWA ("Add to Home Screen") for a standalone app window.
-3. `lesvi url` prints the public URL for the current shelf/artifact; paste it or scan it from your terminal if you wire QR later.
+3. `lesvi url [SHELF [ARTIFACT]]` prints the public URL to open — the home
+   page, a shelf, or one artifact by `NNNN` number, slug substring, or exact
+   relative path:
+
+   ```sh
+   lesvi url                       # home
+   lesvi url data-engg             # shelf page
+   lesvi url data-engg 25          # lessons/0025-… on that shelf
+   ```
+
+## 5. Verify (phone)
+
+The click-through above is accurate when these hold on a real phone:
+
+1. `lesvi status` shows the `public:` URL, and the service is `active`.
+2. Opening the public URL prompts for Access OTP once, then lands on the lesvi
+   home feed.
+3. "Add to Home Screen" installs it; reopening from the icon has no browser
+   chrome (standalone display).
+4. Opening a lesson, then turning on airplane mode and reopening that lesson
+   from history still shows the lesson text from cache (its CSS/JS need the
+   network, so it may render unstyled).
+5. `lesvi url data-engg <NNNN>` prints a deep link; opening it lands on that
+   lesson, not just the home page.
 
 ## Troubleshooting
 

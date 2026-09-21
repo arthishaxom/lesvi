@@ -15,6 +15,10 @@ capability-stamped artifacts — ``/a/~<expiry>-<hmac>/<shelf>/<path>`` — beca
 a sandboxed document's opaque origin sends no cookie on its subresources; a
 session-authorized browser that opens an unsigned document is redirected to its
 signed URL (ADR-0010).
+
+The PWA surface — ``/manifest.webmanifest``, ``/sw.js``, ``/favicon.ico`` — is
+served verbatim and auth-exempt like ``/assets/*``: the phone installs the app
+and its service worker keeps the shell and visited lessons readable offline.
 """
 
 from __future__ import annotations
@@ -79,6 +83,20 @@ CORS_ANY = "*"
 UI_ASSETS: dict[str, str] = {
     "app.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
+    "manifest.webmanifest": "application/manifest+json",
+    "sw.js": "text/javascript; charset=utf-8",
+    "favicon.ico": "image/x-icon",
+    "icon-192.png": "image/png",
+    "icon-512.png": "image/png",
+    "icon-maskable-512.png": "image/png",
+}
+
+#: Static files served at the root, where the PWA needs them: a manifest and
+#: a service worker have fixed addresses, and browsers ask for the favicon.
+STATIC_PATHS: dict[str, str] = {
+    "/manifest.webmanifest": "manifest.webmanifest",
+    "/sw.js": "sw.js",
+    "/favicon.ico": "favicon.ico",
 }
 
 _UI_DIR = Path(__file__).resolve().parent / "ui"
@@ -208,8 +226,10 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
             self._send_home(target.query, include_body=include_body)
         elif path.startswith(SHELF_PREFIX):
             self._send_shelf(path, target.query, include_body=include_body)
+        elif path in STATIC_PATHS:
+            self._send_static(STATIC_PATHS[path], include_body=include_body)
         elif path.startswith(ASSET_PREFIX):
-            self._send_asset(path, include_body=include_body)
+            self._send_static(path[len(ASSET_PREFIX) :], include_body=include_body)
         else:
             self.send_error(404, "not found")
 
@@ -406,8 +426,7 @@ class LesviRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _send_asset(self, path: str, *, include_body: bool) -> None:
-        name = path[len(ASSET_PREFIX) :]
+    def _send_static(self, name: str, *, include_body: bool) -> None:
         content_type = UI_ASSETS.get(name)
         if content_type is None:
             self.send_error(404, "not found")

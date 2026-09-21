@@ -24,6 +24,11 @@ NO_RESULTS = '<p class="no-results" hidden>No artifacts match your search.</p>'
 
 _STYLESHEET = "/assets/app.css"
 _SCRIPT = "/assets/app.js"
+_MANIFEST = "/manifest.webmanifest"
+_ICON = "/assets/icon-192.png"
+#: Keep in step with --accent light / --bg dark and the manifest theme_color.
+_THEME_COLOR_LIGHT = "#0b5cad"
+_THEME_COLOR_DARK = "#101317"
 _THEME_BOOT = (
     '<script>(function(){try{var theme=localStorage.getItem("lesvi-theme");'
     'if(theme==="dark"||theme==="light"){document.documentElement.dataset.theme=theme}'
@@ -298,6 +303,13 @@ def _document(
         "<head>\n"
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'<link rel="manifest" href="{_MANIFEST}">\n'
+        f'<link rel="icon" href="{_ICON}" type="image/png">\n'
+        f'<link rel="apple-touch-icon" href="{_ICON}">\n'
+        f'<meta name="theme-color" content="{_THEME_COLOR_LIGHT}"'
+        ' media="(prefers-color-scheme: light)">\n'
+        f'<meta name="theme-color" content="{_THEME_COLOR_DARK}"'
+        ' media="(prefers-color-scheme: dark)">\n'
         f"<title>{_esc(title)}</title>\n"
         f"{_THEME_BOOT}\n"
         f'<link rel="stylesheet" href="{_STYLESHEET}">\n'

@@ -213,4 +213,14 @@
       }
     });
   }
+  /* PWA: register the service worker where the context allows it. Offline
+     reading is an enhancement — the library works without it. */
+
+  if ("serviceWorker" in navigator && window.isSecureContext) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(() => {
+        /* no caching: every page still loads from the server */
+      });
+    });
+  }
 })();

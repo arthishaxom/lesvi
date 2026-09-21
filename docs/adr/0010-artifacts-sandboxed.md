@@ -60,6 +60,13 @@ hmac = HMAC-SHA256(token, "lesvi-artifact.<expiry>.<shelf>").hexdigest()[:32]
 - Compromised or prompt-injected artifact JS can no longer read the index,
   toggle pins, or borrow the session; it can still run, render, open links, and
   fetch its own shelf's artifacts and assets.
+- **Offline cache**: lesvi's service worker (`/sw.js`) caches the app shell and
+  visited artifact *documents* on the device. Sandboxed documents' subresource
+  requests never reach the service worker — an opaque origin has no worker — so
+  a cached lesson renders without its CSS/JS/images offline. Cached bytes are
+  dropped when the worker sees `/logout` or a `/login` response; rotating the
+  token cannot reach a device that stays offline, which is the same trust the
+  device already holds for its own browsing history.
 - **Sharing semantics**: a signed URL is a bearer capability. Anyone who holds
   one — a shared dashboard link, a chat paste, a browser history sync — can
   read every artifact and asset in that shelf, without logging in, until it

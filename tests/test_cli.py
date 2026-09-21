@@ -16,6 +16,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+import webbrowser
 from collections.abc import Callable
 from importlib.metadata import entry_points
 from importlib.metadata import version as distribution_version
@@ -1167,3 +1168,236 @@ def test_allow_localhost_false_requires_a_login_on_loopback(tmp_path: Path) -> N
         process.communicate(timeout=10)
 
     assert excinfo.value.code == 401
+
+
+# --- phone-ready: `lesvi url` (issue #11) -------------------------------------
+
+
+def _make_url_shelf(root: Path) -> None:
+    """A shelf whose artifacts make number, slug and path lookups distinct."""
+    lessons = root / "lessons"
+    lessons.mkdir(parents=True, exist_ok=True)
+    (lessons / "0024-apache-kafka-fundamentals.html").write_text(
+        "<title>Lesson 24 — Apache Kafka Fundamentals</title>"
+    )
+    (lessons / "0025-schema-registry.html").write_text(
+        "<title>Lesson 25 — Schema Registry</title>"
+    )
+    (lessons / "0026-café notes.html").write_text("<title>Café Notes</title>")
+    reference = root / "reference"
+    reference.mkdir()
+    (reference / "kafka-cheatsheet.html").write_text("<html></html>")
+    research = root / "research"
+    research.mkdir()
+    (research / "kafka-notes.md").write_text("# notes")
+
+
+def _url_setup(tmp_path: Path, **settings: object) -> tuple[Path, Path]:
+    """A config with one URL-test shelf and explicit top-level settings."""
+    shelf = tmp_path / "data-engg"
+    _make_url_shelf(shelf)
+    config = tmp_path / "config.toml"
+    lines = [
+        f"{key} = {value}" if isinstance(value, int) else f'{key} = "{value}"'
+        for key, value in settings.items()
+    ]
+    lines.append(f'[shelves.data-engg]\npath = "{shelf}"')
+    config.write_text("\n".join(lines) + "\n")
+    return config, shelf
+
+
+def test_url_without_arguments_prints_the_browse_home_url(tmp_path: Path) -> None:
+    # A wildcard bind is not browsable; the loopback address stands in.
+    config, _shelf = _url_setup(tmp_path, port=9000, host="0.0.0.0")
+
+    result = _run_cli("url", config=config)
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "http://127.0.0.1:9000/"
+
+
+@pytest.mark.parametrize(
+    "public",
+    ["https://lesvi.example.com", "https://lesvi.example.com/"],
+)
+def test_url_uses_the_public_url_and_trims_a_trailing_slash(
+    tmp_path: Path, public: str
+) -> None:
+    config, _shelf = _url_setup(tmp_path, public_url=public)
+
+    home = _run_cli("url", config=config)
+    shelf = _run_cli("url", "data-engg", config=config)
+
+    assert home.returncode == 0
+    assert home.stdout.strip() == "https://lesvi.example.com/"
+    assert shelf.returncode == 0
+    assert shelf.stdout.strip() == "https://lesvi.example.com/s/data-engg/"
+
+
+def test_url_resolves_an_artifact_by_number(tmp_path: Path) -> None:
+    config, _shelf = _url_setup(tmp_path, public_url="https://lesvi.example.com")
+
+    result = _run_cli("url", "data-engg", "25", config=config)
+
+    assert result.returncode == 0
+    assert (
+        result.stdout.strip()
+        == "https://lesvi.example.com/a/data-engg/lessons/0025-schema-registry.html"
+    )
+
+
+def test_url_resolves_an_artifact_by_slug_substring_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    config, _shelf = _url_setup(tmp_path, public_url="https://lesvi.example.com")
+
+    result = _run_cli("url", "data-engg", "SCHEMA", config=config)
+
+    assert result.returncode == 0
+    assert result.stdout.strip().endswith("/lessons/0025-schema-registry.html")
+
+
+def test_an_exact_relative_path_beats_an_ambiguous_substring(tmp_path: Path) -> None:
+    config, _shelf = _url_setup(tmp_path, public_url="https://lesvi.example.com")
+    exact = "lessons/0024-apache-kafka-fundamentals.html"
+
+    result = _run_cli("url", "data-engg", exact, config=config)
+
+    assert result.returncode == 0
+    assert result.stdout.strip().endswith(f"/a/data-engg/{exact}")
+
+
+def test_url_lists_the_candidates_when_several_artifacts_match(
+    tmp_path: Path,
+) -> None:
+    config, _shelf = _url_setup(tmp_path)
+
+    result = _run_cli("url", "data-engg", "kafka", config=config)
+
+    assert result.returncode == 1
+    assert "kafka" in result.stderr
+    assert "0024-apache-kafka-fundamentals.html" in result.stderr
+    assert "kafka-cheatsheet.html" in result.stderr
+    # Hidden research is indexed but never browsable, so it is not a candidate.
+    assert "kafka-notes.md" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_url_does_not_resolve_a_hidden_research_artifact(tmp_path: Path) -> None:
+    config, _shelf = _url_setup(tmp_path)
+
+    result = _run_cli("url", "data-engg", "kafka-notes", config=config)
+
+    assert result.returncode == 1
+    assert "hidden" in result.stderr
+    assert "kafka-notes.md" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_url_accepts_a_percent_encoded_lookup(tmp_path: Path) -> None:
+    config, _shelf = _url_setup(tmp_path, public_url="https://lesvi.example.com")
+
+    result = _run_cli("url", "data-engg", "caf%C3%A9", config=config)
+
+    assert result.returncode == 0
+    assert (
+        result.stdout.strip()
+        == "https://lesvi.example.com/a/data-engg/lessons/0026-caf%C3%A9%20notes.html"
+    )
+
+
+def test_url_rejects_an_empty_artifact_lookup(tmp_path: Path) -> None:
+    config, _shelf = _url_setup(tmp_path)
+
+    result = _run_cli("url", "data-engg", "", config=config)
+
+    assert result.returncode == 1
+    assert "artifact" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("0.0.0.0", "http://127.0.0.1:8787/"),
+        ("[::]", "http://127.0.0.1:8787/"),
+        ("::1", "http://[::1]:8787/"),
+    ],
+)
+def test_url_browse_hosts_cover_wildcards_and_ipv6(
+    tmp_path: Path, host: str, expected: str
+) -> None:
+    config, _shelf = _url_setup(tmp_path, host=host)
+
+    result = _run_cli("url", config=config)
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == expected
+
+
+def test_url_reports_an_unknown_shelf_with_the_registered_names(
+    tmp_path: Path,
+) -> None:
+    config, _shelf = _url_setup(tmp_path)
+
+    result = _run_cli("url", "nope", config=config)
+
+    assert result.returncode == 1
+    assert "nope" in result.stderr
+    assert "data-engg" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_url_reports_an_unknown_artifact(tmp_path: Path) -> None:
+    config, _shelf = _url_setup(tmp_path)
+
+    result = _run_cli("url", "data-engg", "zzz", config=config)
+
+    assert result.returncode == 1
+    assert "zzz" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_url_open_launches_the_browser_with_the_printed_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config, _shelf = _url_setup(tmp_path, public_url="https://lesvi.example.com")
+    monkeypatch.setenv("LESVI_CONFIG", str(config))
+    monkeypatch.setenv("LESVI_STATE", str(tmp_path / "state.json"))
+    opened: list[str] = []
+
+    def launch(url: str) -> bool:
+        opened.append(url)
+        return True
+
+    monkeypatch.setattr(webbrowser, "open", launch)
+
+    code = main(["url", "--open"])
+
+    assert code == 0
+    assert opened == ["https://lesvi.example.com/"]
+    assert capsys.readouterr().out.strip() == "https://lesvi.example.com/"
+
+
+def test_url_open_reports_a_browser_that_cannot_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config, _shelf = _url_setup(tmp_path)
+    monkeypatch.setenv("LESVI_CONFIG", str(config))
+    monkeypatch.setenv("LESVI_STATE", str(tmp_path / "state.json"))
+
+    def refuse(_url: str) -> bool:
+        return False
+
+    monkeypatch.setattr(webbrowser, "open", refuse)
+
+    code = main(["url", "--open"])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "browser" in captured.err
+    assert "http://127.0.0.1:8787/" in captured.out  # the URL is still printed

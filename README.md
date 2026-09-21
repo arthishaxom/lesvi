@@ -14,8 +14,9 @@ scaffold, shelf registration (`lesvi add` / `list` / `remove`), the scanning
 index behind `lesvi serve`, byte-for-byte raw artifact serving, the home feed /
 shelf pages, the agent metadata overrides (sidecar + `lesvi:*` meta tags), live
 index updates (native events or mtime polling), the fallback auth layer (token
-login, signed session cookie, Bearer, direct-loopback exemption), and the
-always-on systemd user service (`lesvi service`, `lesvi status`, `-v` logging)
+login, signed session cookie, Bearer, direct-loopback exemption), the always-on
+systemd user service (`lesvi service`, `lesvi status`, `-v` logging), and the
+phone experience (`lesvi url`, installable PWA with an offline service worker)
 are in place.
 
 ## Requirements
@@ -142,6 +143,37 @@ and valid for 30 days: anyone you share such a link with can read that shelf's
 artifacts and assets without logging in, so treat dashboard and
 `/api/index.json` URLs as shareable. Changing the token revokes every
 outstanding link and session at once.
+
+## Phone
+
+Open the public URL on the phone, complete the Cloudflare Access login, and
+install the app — the manifest plus maskable icons make it a standalone PWA
+("Add to Home Screen"). A service worker precaches the app shell and the index
+and keeps visited lesson pages: it serves the cached copy first and refreshes
+it in the background, so the dashboard and lesson text read on flaky mobile
+networks and offline. Because sandboxed documents (ADR-0010) run in an opaque
+origin, browsers do not route their CSS/JS/image requests through the service
+worker — those still need the network, so an offline lesson can render
+unstyled. Requests made before logging in are never cached, and logging out
+(or reaching the login page) drops the cache.
+
+`lesvi url` prints the URL to open (the `public_url` when configured, else the
+local address), resolving a shelf or one artifact by number, slug substring, or
+exact relative path:
+
+```sh
+uv run lesvi url                              # the home page
+uv run lesvi url data-engg                    # one shelf
+uv run lesvi url data-engg 25                 # artifact 0025-…
+uv run lesvi url data-engg kafka              # slug substring
+uv run lesvi url data-engg lessons/0024-apache-kafka-fundamentals.html
+uv run lesvi url data-engg 25 --open          # also open the printed URL here
+```
+
+A lookup that matches several artifacts fails and lists the candidates — pass
+the `NNNN` or the exact relative path. The Cloudflare click-through and a
+phone verification checklist live in
+[docs/cloudflare-setup.md](docs/cloudflare-setup.md).
 
 ## Enriching artifacts
 
