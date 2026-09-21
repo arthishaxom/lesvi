@@ -170,6 +170,34 @@ def render_shelf(
     return _document(title=title, index=index, active=shelf.name, main="".join(main))
 
 
+def render_login(*, error: bool = False) -> str:
+    """The ``/login`` page: a plain form that posts the shared token.
+
+    Reads without JavaScript; the theme boot keeps a previously chosen theme.
+    """
+    message = (
+        '<p class="login-error" role="alert">That token is not correct. '
+        "Try again.</p>"
+        if error
+        else ""
+    )
+    main = (
+        '<main id="main" class="wrap login">'
+        '<h1 class="login-title">lesvi</h1>'
+        '<p class="login-lede">Enter the access token to open the library.</p>'
+        f"{message}"
+        '<form class="login-form" method="post" action="/login">'
+        '<label class="login-label" for="token">Access token</label>'
+        '<input class="login-input" id="token" name="token" type="password"'
+        ' autocomplete="current-password" spellcheck="false" required autofocus>'
+        '<button class="login-button" type="submit">Sign in</button>'
+        "</form></main>"
+    )
+    return _document(
+        title="Sign in · lesvi", index=None, active=None, main=main, script=False
+    )
+
+
 def _sort_toggle(shelf: Shelf, *, recent: bool) -> str:
     base = _shelf_url(shelf.name)
     curriculum_current = "" if recent else ' aria-current="page"'
@@ -254,7 +282,16 @@ def _cards(artifacts: tuple[Artifact, ...], now: datetime | None) -> str:
     )
 
 
-def _document(*, title: str, index: Index, active: str | None, main: str) -> str:
+def _document(
+    *,
+    title: str,
+    index: Index | None,
+    active: str | None,
+    main: str,
+    script: bool = True,
+) -> str:
+    header = f"{_header(index, active)}\n" if index is not None else ""
+    script_tag = f'<script src="{_SCRIPT}" defer></script>\n' if script else ""
     return (
         "<!doctype html>\n"
         '<html lang="en">\n'
@@ -264,11 +301,11 @@ def _document(*, title: str, index: Index, active: str | None, main: str) -> str
         f"<title>{_esc(title)}</title>\n"
         f"{_THEME_BOOT}\n"
         f'<link rel="stylesheet" href="{_STYLESHEET}">\n'
-        f'<script src="{_SCRIPT}" defer></script>\n'
+        f"{script_tag}"
         "</head>\n"
         "<body>\n"
         '<a class="skip-link" href="#main">Skip to content</a>\n'
-        f"{_header(index, active)}\n"
+        f"{header}"
         f"{main}\n"
         '<p class="pin-status visually-hidden" id="pin-status" role="status"'
         ' aria-live="polite"></p>\n'
@@ -344,5 +381,6 @@ __all__ = [
     "RECENT_SORT",
     "relative_time",
     "render_home",
+    "render_login",
     "render_shelf",
 ]

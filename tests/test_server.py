@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import hashlib
 import http.client
@@ -13,16 +14,17 @@ import stat
 import struct
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 import pytest
 
+from lesvi.auth import ARTIFACT_URL_TTL, SESSION_TTL, Auth
 from lesvi.config import Config, resolve_path
 from lesvi.index import Index
-from lesvi.server import LesviServer, make_server
+from lesvi.server import ARTIFACT_SANDBOX, LOGIN_BODY_LIMIT, LesviServer, make_server
 from lesvi.state import PinState
 
 LESSON_PATH = "lessons/0024-apache-kafka-fundamentals.html"
@@ -113,22 +115,44 @@ def pin_state_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
-@pytest.fixture
-def server(index: Index) -> Iterator[LesviServer]:
-    server = make_server(index, "127.0.0.1", 0)
+@contextlib.contextmanager
+def _running(server: LesviServer) -> Generator[tuple[str, int]]:
+    """Serve *server* on a background thread for the duration of the block."""
     thread = threading.Thread(
         target=lambda: server.serve_forever(poll_interval=0.01), daemon=True
     )
     thread.start()
-    yield server
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=5)
+    try:
+        yield str(server.server_address[0]), int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def server(index: Index) -> Iterator[LesviServer]:
+    server = make_server(index, "127.0.0.1", 0)
+    with _running(server):
+        yield server
 
 
 @pytest.fixture
 def server_address(server: LesviServer) -> tuple[str, int]:
     return str(server.server_address[0]), int(server.server_address[1])
+
+
+@pytest.fixture
+def authed_server(index: Index) -> Iterator[LesviServer]:
+    """A server with a token: auth is on, loopback stays exempt."""
+    server = make_server(index, "127.0.0.1", 0, auth=Auth(TOKEN))
+    with _running(server):
+        yield server
+
+
+@pytest.fixture
+def authed_address(authed_server: LesviServer) -> tuple[str, int]:
+    return str(authed_server.server_address[0]), int(authed_server.server_address[1])
 
 
 def _get(
@@ -1146,3 +1170,692 @@ def test_building_the_index_and_crawling_every_artifact_leaves_the_shelf_untouch
         _get(server_address, extra).read()
 
     assert {root: _sweep(root) for root in roots} == before
+
+
+# --- auth (issue #9) ----------------------------------------------------------
+
+TOKEN = "s3cret-token"
+#: What cloudflared adds to every proxied request; it must force a login.
+TUNNELED = {"CF-Connecting-IP": "203.0.113.9"}
+BEARER = {"Authorization": f"Bearer {TOKEN}"}
+
+
+def _login(
+    server_address: tuple[str, int], token: str, **headers: str
+) -> http.client.HTTPResponse:
+    return _request(
+        server_address,
+        "POST",
+        "/login",
+        body=urlencode({"token": token}),
+        **{"Content-Type": "application/x-www-form-urlencoded", **headers},
+    )
+
+
+def _session_cookie(server_address: tuple[str, int], **headers: str) -> str:
+    """Log in and return the ``name=value`` pair from ``Set-Cookie``."""
+    response = _login(server_address, TOKEN, **headers)
+    assert response.status == 303
+    return (response.getheader("Set-Cookie") or "").split(";", 1)[0]
+
+
+def test_a_direct_loopback_request_needs_no_login(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/")
+
+    assert response.status == 200
+    response.read()
+
+
+@pytest.mark.parametrize(
+    "forwarding",
+    [
+        {"CF-Connecting-IP": "203.0.113.9"},
+        {"X-Forwarded-For": "203.0.113.9"},
+        {"cf-connecting-ip": "203.0.113.9"},  # header names are case-insensitive
+        {"x-forwarded-for": "203.0.113.9"},
+    ],
+)
+def test_cloudflare_forwarding_headers_force_the_login_page(
+    authed_address: tuple[str, int], forwarding: dict[str, str]
+) -> None:
+    for path in ("/", "/s/data-engg/", f"/a/data-engg/{LESSON_PATH}"):
+        response = _get(authed_address, path, **forwarding)
+
+        assert response.status == 303, path
+        assert response.getheader("Location") == "/login", path
+        assert response.read() == b""
+
+
+def test_an_unauthenticated_api_request_is_401_not_a_redirect(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/api/index.json", **TUNNELED)
+
+    assert response.status == 401
+    assert response.getheader("Location") is None
+    assert response.getheader("Cache-Control") == "no-store"
+    assert json.loads(response.read()) == {"error": "unauthorized"}
+
+
+def test_a_bearer_token_authorizes_scripts(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/api/index.json", **TUNNELED, **BEARER)
+
+    assert response.status == 200
+    assert json.loads(response.read())["shelves"]
+
+
+def test_a_wrong_bearer_token_is_refused(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(
+        authed_address,
+        "/api/index.json",
+        **TUNNELED,
+        Authorization="Bearer not-the-token",
+    )
+
+    assert response.status == 401
+    assert response.getheader("Location") is None
+    assert json.loads(response.read()) == {"error": "unauthorized"}
+
+
+def test_login_sets_a_signed_session_cookie_that_authorizes(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _login(authed_address, TOKEN, **TUNNELED)
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/"
+    cookie = response.getheader("Set-Cookie") or ""
+    assert cookie.startswith("lesvi_session=")
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+    assert "Path=/" in cookie
+    assert f"Max-Age={SESSION_TTL}" in cookie
+    assert "Secure" not in cookie
+    assert response.getheader("Cache-Control") == "no-store"
+    assert response.read() == b""
+
+    pair = cookie.split(";", 1)[0]
+    home = _get(authed_address, "/", **TUNNELED, Cookie=pair)
+    api = _get(authed_address, "/api/index.json", **TUNNELED, Cookie=pair)
+
+    assert home.status == 200
+    home.read()
+    assert api.status == 200
+    assert json.loads(api.read())["shelves"]
+
+
+def test_a_tampered_session_cookie_is_refused(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+    name, _, value = pair.partition("=")
+    tampered = f"{name}={value[:-1]}{'0' if value[-1] != '0' else '1'}"
+
+    response = _get(authed_address, "/", **TUNNELED, Cookie=tampered)
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/login"
+    response.read()
+
+
+def test_a_non_ascii_session_cookie_is_refused_without_a_crash(
+    authed_address: tuple[str, int],
+) -> None:
+    """Malformed cookies must not raise inside ``hmac.compare_digest``."""
+    response = _get(
+        authed_address,
+        "/",
+        **TUNNELED,
+        Cookie="lesvi_session=9999999999.é",
+    )
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/login"
+    response.read()
+
+
+def test_login_with_a_wrong_token_rerenders_the_form_without_a_cookie(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _login(authed_address, "wrong-token", **TUNNELED)
+
+    assert response.status == 401
+    assert response.getheader("Set-Cookie") is None
+    body = response.read().decode()
+    assert 'action="/login"' in body
+    assert 'name="token"' in body
+    assert "not correct" in body
+
+
+def test_login_behind_https_marks_the_cookie_secure(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _login(
+        authed_address, TOKEN, **TUNNELED, **{"x-forwarded-proto": "https"}
+    )
+
+    assert f"Max-Age={SESSION_TTL}" in (response.getheader("Set-Cookie") or "")
+    assert "Secure" in (response.getheader("Set-Cookie") or "")
+    response.read()
+
+
+@pytest.mark.parametrize("content_length", ["abc", "0", str(LOGIN_BODY_LIMIT + 1)])
+def test_a_malformed_login_body_is_rejected_and_closes(
+    authed_address: tuple[str, int], content_length: str
+) -> None:
+    response = _request(
+        authed_address,
+        "POST",
+        "/login",
+        body=b"",
+        **{
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": content_length,
+            **TUNNELED,
+        },
+    )
+
+    assert response.status == 400
+    assert response.getheader("Connection") == "close"
+    response.read()
+
+
+def test_logout_clears_the_session_cookie(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/logout", **TUNNELED)
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/login"
+    cookie = response.getheader("Set-Cookie") or ""
+    assert cookie.startswith("lesvi_session=;")
+    assert "Max-Age=0" in cookie
+    assert response.getheader("Cache-Control") == "no-store"
+    assert response.read() == b""
+
+
+def test_the_login_form_reads_without_scripts(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/login", **TUNNELED)
+    body = response.read().decode()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/html; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-store"
+    assert 'method="post" action="/login"' in body
+    assert 'id="token"' in body
+    assert "/assets/app.js" not in body
+
+
+def test_login_without_a_configured_token_goes_straight_home(
+    server_address: tuple[str, int],
+) -> None:
+    page = _get(server_address, "/login")
+    submission = _login(server_address, "anything")
+
+    assert page.status == 303
+    assert page.getheader("Location") == "/"
+    assert submission.status == 303
+    assert submission.getheader("Location") == "/"
+    assert submission.getheader("Set-Cookie") is None
+    assert submission.getheader("Connection") == "close"
+
+
+def test_exempt_paths_skip_the_login_redirect(
+    authed_address: tuple[str, int],
+) -> None:
+    for path in ("/login", "/healthz", "/assets/app.css"):
+        response = _get(authed_address, path, **TUNNELED)
+        assert response.status == 200, path
+        response.read()
+
+    # Not implemented yet (PWA ticket #11), but never behind the login either.
+    for path in ("/manifest.webmanifest", "/sw.js", "/favicon.ico"):
+        response = _get(authed_address, path, **TUNNELED)
+        assert response.status == 404, path
+        assert response.getheader("Location") is None, path
+        response.read()
+
+
+def test_healthz_reports_counts_without_a_login(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/healthz", **TUNNELED)
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "application/json; charset=utf-8"
+    assert response.getheader("Cache-Control") == "no-store"
+    payload = json.loads(response.read())
+    assert payload == {"ok": True, "shelves": 2, "artifacts": 5}
+
+
+def test_the_pin_api_refuses_an_unauthenticated_request(
+    authed_address: tuple[str, int], pin_state_file: Path
+) -> None:
+    response = _request(
+        authed_address,
+        "POST",
+        "/api/pin",
+        body=json.dumps(
+            {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True}
+        ).encode(),
+        **{"Content-Type": "application/json", **TUNNELED},
+    )
+
+    assert response.status == 401
+    assert response.read()
+    assert not pin_state_file.exists()
+
+
+def test_a_session_cookie_authorizes_the_pin_api(
+    authed_address: tuple[str, int], pin_state_file: Path
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+
+    response = _request(
+        authed_address,
+        "POST",
+        "/api/pin",
+        body=json.dumps(
+            {"shelf": "data-engg", "path": LESSON_PATH, "pinned": True}
+        ).encode(),
+        **{
+            "Content-Type": "application/json",
+            "Cookie": pair,
+            **TUNNELED,
+        },
+    )
+
+    assert response.status == 204
+    assert response.read() == b""
+    assert json.loads(pin_state_file.read_text())["pins"] == [
+        f"data-engg/{LESSON_PATH}"
+    ]
+
+
+def test_allow_localhost_false_requires_a_login_even_on_loopback(
+    index: Index,
+) -> None:
+    server = make_server(index, "127.0.0.1", 0, auth=Auth(TOKEN, allow_localhost=False))
+    with _running(server) as address:
+        response = _get(address, "/")
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/login"
+    response.read()
+
+
+# --- raw artifacts: sandbox and signed links (ADR-0010) -----------------------
+
+
+def _signed_url(
+    relative: str, shelf: str = "data-engg", *, now: float | None = None
+) -> str:
+    """An ``/a/`` URL carrying a fresh capability for *shelf*."""
+    stamp = Auth(TOKEN).artifact_stamp(shelf, now=now)
+    return f"/a/{stamp}/{shelf}/{relative}"
+
+
+def _signed_hrefs(body: str) -> list[str]:
+    return [href for href in _artifact_hrefs(body) if href.startswith("/a/~")]
+
+
+def test_artifacts_are_sandboxed_and_readable_cross_origin(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, _signed_url(LESSON_PATH), **TUNNELED)
+
+    assert response.status == 200
+    assert response.getheader("Content-Security-Policy") == ARTIFACT_SANDBOX
+    assert response.getheader("Access-Control-Allow-Origin") == "*"
+    assert response.read() == LESSON_BYTES
+
+
+def test_artifact_subresources_and_conditional_responses_keep_cors(
+    authed_address: tuple[str, int],
+) -> None:
+    url = _signed_url("assets/quiz.js")
+    asset = _get(authed_address, url, **TUNNELED)
+    assert asset.getheader("Access-Control-Allow-Origin") == "*"
+    assert asset.getheader("Content-Security-Policy") == ARTIFACT_SANDBOX
+    asset.read()
+
+    etag = asset.getheader("ETag") or ""
+    conditional = _get(
+        authed_address, url, **TUNNELED, **{"If-None-Match": etag}
+    )
+    assert conditional.status == 304
+    assert conditional.getheader("Access-Control-Allow-Origin") == "*"
+    conditional.read()
+
+
+def test_the_authenticated_api_has_no_cors_for_sandboxed_artifacts(
+    authed_address: tuple[str, int],
+) -> None:
+    for path in ("/", "/s/data-engg/", "/api/index.json"):
+        response = _get(authed_address, path, **TUNNELED, **BEARER)
+        assert response.getheader("Access-Control-Allow-Origin") is None, path
+        response.read()
+
+
+def test_dashboard_pages_link_to_signed_artifacts(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+
+    home = _get(authed_address, "/", **TUNNELED, Cookie=pair)
+    home_body = home.read().decode()
+    shelf = _get(authed_address, "/s/data-engg/", **TUNNELED, Cookie=pair)
+    shelf_body = shelf.read().decode()
+    recent = _get(
+        authed_address, "/s/data-engg/?sort=recent", **TUNNELED, Cookie=pair
+    )
+    recent_body = recent.read().decode()
+
+    assert home.status == 200
+    assert shelf.status == 200
+    assert recent.status == 200
+    # Every card link is signed; none of them are unsigned.
+    assert len(_signed_hrefs(home_body)) == 4
+    assert len(_signed_hrefs(shelf_body)) == 4
+    assert len(_signed_hrefs(recent_body)) == 4
+    assert len(_artifact_hrefs(home_body)) == len(_signed_hrefs(home_body))
+    assert len(_artifact_hrefs(shelf_body)) == len(_signed_hrefs(shelf_body))
+    assert len(_artifact_hrefs(recent_body)) == len(_signed_hrefs(recent_body))
+    # A sandboxed document fetches these with no cookie; the stamp must carry.
+    for href in _signed_hrefs(home_body):
+        document = _get(authed_address, href, **TUNNELED)
+        assert document.status == 200, href
+        document.read()
+
+
+def test_api_index_links_to_signed_artifacts(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+
+    response = _get(authed_address, "/api/index.json", **TUNNELED, Cookie=pair)
+    payload = json.loads(response.read())
+
+    urls = [record["url"] for record in payload["artifacts"]]
+    assert urls
+    assert all(url.startswith("/a/~") for url in urls)
+    for url in urls:
+        artifact = _get(authed_address, url, **TUNNELED)
+        assert artifact.status == 200, url
+        artifact.read()
+
+
+def test_a_signed_subresource_is_served_without_any_cookie(
+    authed_address: tuple[str, int],
+) -> None:
+    """The regression this design exists for: sandboxed fetches send no cookie."""
+    response = _get(authed_address, _signed_url("assets/quiz.js"), **TUNNELED)
+
+    assert response.status == 200
+    assert response.getheader("Access-Control-Allow-Origin") == "*"
+    assert response.read() == b"void 'quiz';\n"
+
+
+def test_an_unsigned_subresource_without_a_cookie_is_refused(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _get(authed_address, "/a/data-engg/assets/quiz.js", **TUNNELED)
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/login"
+    assert response.read() == b""
+
+
+def test_an_unsigned_document_with_a_session_redirects_to_its_signed_url(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+
+    response = _get(
+        authed_address, f"/a/data-engg/{LESSON_PATH}", **TUNNELED, Cookie=pair
+    )
+
+    assert response.status == 302
+    location = response.getheader("Location") or ""
+    assert response.getheader("Cache-Control") == "no-store"
+    stamp, _, remainder = location.removeprefix("/a/").partition("/")
+    assert Auth(TOKEN).artifact_stamp_valid(stamp, "data-engg")
+    assert remainder == f"data-engg/{LESSON_PATH}"
+    response.read()
+
+    document = _get(authed_address, location, **TUNNELED)  # no cookie
+    assert document.status == 200
+    assert document.getheader("Content-Security-Policy") == ARTIFACT_SANDBOX
+    assert document.getheader("Access-Control-Allow-Origin") == "*"
+    assert document.read() == LESSON_BYTES
+
+
+def test_the_signed_document_keeps_relative_subresources_reachable(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+    redirect = _get(
+        authed_address, f"/a/data-engg/{LESSON_PATH}", **TUNNELED, Cookie=pair
+    )
+    location = redirect.getheader("Location") or ""
+    redirect.read()
+
+    # ``urljoin`` is how the browser resolves the lesson's ``../assets/...``.
+    quiz = _get(authed_address, urljoin(location, "../assets/quiz.js"), **TUNNELED)
+    css = _get(authed_address, urljoin(location, "../assets/lesson.css"), **TUNNELED)
+    png = _get(authed_address, urljoin(location, "../assets/diagram.png"), **TUNNELED)
+
+    assert quiz.status == 200
+    assert quiz.read() == b"void 'quiz';\n"
+    assert css.status == 200
+    css.read()
+    assert png.status == 200
+    png.read()
+
+
+def test_local_and_bearer_requests_keep_the_unsigned_document(
+    authed_address: tuple[str, int],
+) -> None:
+    local = _get(authed_address, f"/a/data-engg/{LESSON_PATH}")
+    bearer = _get(authed_address, f"/a/data-engg/{LESSON_PATH}", **TUNNELED, **BEARER)
+
+    assert local.status == 200
+    assert local.read() == LESSON_BYTES
+    assert bearer.status == 200
+    assert bearer.read() == LESSON_BYTES
+
+
+def test_a_non_document_with_a_session_is_served_unsigned(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+
+    response = _get(
+        authed_address, "/a/data-engg/assets/diagram.png", **TUNNELED, Cookie=pair
+    )
+
+    assert response.status == 200
+    assert response.getheader("Location") is None
+    response.read()
+
+
+def test_an_unsigned_document_redirect_keeps_its_query(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+
+    response = _get(
+        authed_address,
+        f"/a/data-engg/{LESSON_PATH}?mode=quiz",
+        **TUNNELED,
+        Cookie=pair,
+    )
+
+    assert response.status == 302
+    assert (response.getheader("Location") or "").endswith("?mode=quiz")
+    response.read()
+
+
+def test_an_expired_stamp_is_not_a_credential(
+    authed_address: tuple[str, int],
+) -> None:
+    stale = _signed_url("assets/quiz.js", now=time.time() - ARTIFACT_URL_TTL - 10)
+
+    response = _get(authed_address, stale, **TUNNELED)
+
+    assert response.status == 303
+    assert response.getheader("Location") == "/login"
+    response.read()
+
+
+def test_a_tampered_stamp_is_not_a_credential(
+    authed_address: tuple[str, int],
+) -> None:
+    stamp = Auth(TOKEN).artifact_stamp("data-engg")
+    tampered = f"{stamp[:-1]}{'0' if stamp[-1] != '0' else '1'}"
+
+    response = _get(
+        authed_address, f"/a/{tampered}/data-engg/assets/quiz.js", **TUNNELED
+    )
+
+    assert response.status == 303
+    response.read()
+
+
+def test_a_stamp_for_another_shelf_does_not_authorize(
+    authed_address: tuple[str, int],
+) -> None:
+    stamp = Auth(TOKEN).artifact_stamp("ricing")
+
+    response = _get(
+        authed_address, f"/a/{stamp}/data-engg/assets/quiz.js", **TUNNELED
+    )
+
+    assert response.status == 303
+    response.read()
+
+
+def test_an_expired_stamp_with_a_session_redirects_to_a_fresh_one(
+    authed_address: tuple[str, int],
+) -> None:
+    pair = _session_cookie(authed_address, **TUNNELED)
+    stale = _signed_url(LESSON_PATH, now=time.time() - ARTIFACT_URL_TTL - 10)
+
+    response = _get(authed_address, stale, **TUNNELED, Cookie=pair)
+
+    assert response.status == 302
+    location = response.getheader("Location") or ""
+    assert location != stale
+    stamp, _, _ = location.removeprefix("/a/").partition("/")
+    assert Auth(TOKEN).artifact_stamp_valid(stamp, "data-engg")
+    response.read()
+
+
+def test_a_signed_request_cannot_smuggle_paths_out_of_the_shelf(
+    authed_address: tuple[str, int],
+) -> None:
+    stamp = Auth(TOKEN).artifact_stamp("data-engg")
+
+    for relative in (
+        "../outside.html",
+        "%2e%2e%2foutside.html",
+        ".hidden/secret.html",
+        "node_modules/pkg/readme.html",
+        "lessons/0026-escape.html",  # a symlink out of the shelf
+        "lessons/0028-passwd.html",  # a symlink to /etc/passwd
+    ):
+        response = _get(authed_address, f"/a/{stamp}/data-engg/{relative}", **TUNNELED)
+        assert response.status == 404, relative
+        assert b"Outside Secret" not in response.read(), relative
+
+
+# --- auth wire behaviour (issue #9 review) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "status"),
+    [
+        ("/api/index.json", 401),
+        ("/api/index.json?q=1", 401),
+        ("/API/index.json", 303),
+        # http.server collapses a leading ``//`` to ``/``, so this reaches the
+        # API branch and gets the JSON refusal.
+        ("//api/index.json", 401),
+        ("/api%2Findex.json", 303),
+        ("/Assets/app.css", 303),
+        ("/a/data-engg/assets/quiz.js", 303),
+    ],
+)
+def test_unauthenticated_wire_forms_are_refused(
+    authed_address: tuple[str, int], path: str, status: int
+) -> None:
+    response = _get(authed_address, path, **TUNNELED)
+
+    assert response.status == status
+    assert response.getheader("Access-Control-Allow-Origin") is None
+    response.read()
+
+
+def test_an_absolute_form_target_is_authorized_like_its_path(
+    authed_address: tuple[str, int],
+) -> None:
+    refused = _get(
+        authed_address, "http://lesvi.example.com/api/index.json", **TUNNELED
+    )
+    allowed = _get(
+        authed_address,
+        "http://lesvi.example.com/api/index.json",
+        **TUNNELED,
+        **BEARER,
+    )
+
+    assert refused.status == 401
+    refused.read()
+    assert allowed.status == 200
+    assert json.loads(allowed.read())["shelves"]
+
+
+def test_a_head_refusal_has_headers_but_no_body(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _request(authed_address, "HEAD", "/api/index.json", **TUNNELED)
+
+    assert response.status == 401
+    assert response.getheader("Content-Length") == str(
+        len(b'{"error":"unauthorized"}\n')
+    )
+    assert response.read() == b""
+
+
+def test_a_refused_post_announces_that_the_connection_closes(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _request(
+        authed_address,
+        "POST",
+        "/api/pin",
+        body=b"{}",
+        **{"Content-Type": "application/json", **TUNNELED},
+    )
+
+    assert response.status == 401
+    assert response.getheader("Connection") == "close"
+    response.read()
+
+
+def test_a_refused_get_with_a_declared_body_also_closes(
+    authed_address: tuple[str, int],
+) -> None:
+    response = _request(authed_address, "GET", "/", body=b"hello", **TUNNELED)
+
+    assert response.status == 303
+    assert response.getheader("Connection") == "close"
+    response.read()

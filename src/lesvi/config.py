@@ -8,6 +8,7 @@ formatting, and unknown keys all survive ``lesvi add`` / ``lesvi remove``.
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import math
 import os
 import re
@@ -84,6 +85,17 @@ def validate_host(value: str) -> str:
             "'host' must not be empty; use 0.0.0.0 to bind every interface"
         )
     return host
+
+
+def is_loopback_host(value: str) -> bool:
+    """Whether *value* names this machine: ``localhost`` or a loopback IP."""
+    host = value.strip().strip("[]")
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def glob_match(pattern: str, rel: str) -> bool:
@@ -305,6 +317,26 @@ class Config:
                 f"{self.path}: 'poll_interval' must be a positive, finite number"
             )
         return interval
+
+    def auth_token(self) -> str | None:
+        """The configured fallback token; ``None`` when unset.
+
+        An empty string counts as unset, so a placeholder cannot quiet the
+        "no token on a non-loopback bind" refusal.
+        """
+        raw = self.data.get("auth_token")
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ConfigError(f"{self.path}: 'auth_token' must be a string")
+        return raw or None
+
+    def allow_localhost(self) -> bool:
+        """Whether direct loopback requests skip auth (default true)."""
+        raw = self.data.get("allow_localhost", True)
+        if not isinstance(raw, bool):
+            raise ConfigError(f"{self.path}: 'allow_localhost' must be a boolean")
+        return raw
 
     def find_shelf_by_path(self, path: Path) -> str | None:
         """Return the name of the shelf registered at *path*, if any."""

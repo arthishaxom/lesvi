@@ -294,6 +294,8 @@ def test_server_settings_default_and_override(tmp_path: Path) -> None:
         ("poll_interval = inf\n", "poll_interval"),
         ("poll_interval = -inf\n", "poll_interval"),
         ("poll_interval = nan\n", "poll_interval"),
+        ("allow_localhost = 5\n", "allow_localhost"),
+        ('allow_localhost = "no"\n', "allow_localhost"),
     ],
 )
 def test_bad_server_settings_raise_config_error(

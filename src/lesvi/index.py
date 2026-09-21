@@ -7,7 +7,7 @@ path); recency is mtime descending.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -154,6 +154,34 @@ class Index:
         if not changed and state is self.state:
             return self
         return Index(shelves, state=state)
+
+    def with_urls(self, url_for: Callable[[Artifact], str]) -> Index:
+        """Rewrite every artifact's ``url`` with *url_for*.
+
+        The server signs artifact links per request (ADR-0010) so sandboxed
+        documents can fetch their subresources without a cookie. Mirrors
+        :meth:`with_pins`: the sorted views and the pin state are preserved,
+        and ``self`` comes back when no URL would change.
+        """
+        shelves: dict[str, Shelf] = {}
+        changed = False
+        for name, shelf in self.shelves.items():
+            curriculum = tuple(
+                replace(record, url=url_for(record)) for record in shelf.curriculum
+            )
+            if curriculum == shelf.curriculum:
+                shelves[name] = shelf
+                continue
+            changed = True
+            resolved = {record.path: record for record in curriculum}
+            shelves[name] = replace(
+                shelf,
+                curriculum=curriculum,
+                recency=tuple(resolved[record.path] for record in shelf.recency),
+            )
+        if not changed:
+            return self
+        return Index(shelves, state=self.state)
 
     def changed(
         self,

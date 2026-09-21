@@ -13,8 +13,10 @@ tracked as [open tickets](https://github.com/arthishaxom/lesvi/issues). The
 scaffold, shelf registration (`lesvi add` / `list` / `remove`), the scanning
 index behind `lesvi serve`, byte-for-byte raw artifact serving, the home feed /
 shelf pages, the agent metadata overrides (sidecar + `lesvi:*` meta tags), live
-index updates (native events or mtime polling), and the always-on systemd user
-service (`lesvi service`, `lesvi status`, `-v` logging) are in place.
+index updates (native events or mtime polling), the fallback auth layer (token
+login, signed session cookie, Bearer, direct-loopback exemption), and the
+always-on systemd user service (`lesvi service`, `lesvi status`, `-v` logging)
+are in place.
 
 ## Requirements
 
@@ -76,9 +78,12 @@ URL reopens the same filtered view with the result count announced. Cards also
 carry a pin toggle: it updates optimistically and stores the decision through
 `POST /api/pin` (`{"shelf", "path", "pinned"}` → `204`). Each indexed artifact
 and its relative assets are served byte-for-byte at `/a/<shelf>/<path>` with
-`ETag`/`Last-Modified` revalidation. The UI assets (`/assets/app.css`,
+`ETag`/`Last-Modified` revalidation. Artifact documents are sandboxed to an
+opaque origin, so their quiz/mermaid JavaScript runs but cannot read the
+authenticated API (ADR-0010). The UI assets (`/assets/app.css`,
 `/assets/app.js`) add the persisted theme toggle; pages read fine with
-JavaScript disabled. Auth lands with its feature ticket.
+JavaScript disabled. Auth (below) protects everything except the login form,
+health check and static UI.
 
 The index keeps itself current while `serve` runs: writing, overwriting,
 renaming or deleting a lesson (or its `.meta.json` sidecar) updates the feed
@@ -87,6 +92,56 @@ filesystem events do the work; otherwise mtimes are polled every `poll_interval`
 seconds (default 2; `watch = false` or `--no-watch` disables watching, and
 `--poll-interval S` forces polling). Ignored paths stay ignored, bursts are
 debounced, and a chunked write is parsed once it settles.
+
+## Auth
+
+Cloudflare Access is the primary gate; lesvi's token is the fallback that still
+holds when Access is off or the tunnel URL leaks (ADR-0004). One shared secret
+is read in this order — **`$LESVI_TOKEN` > `--token` > `auth_token`** in the
+config:
+
+```sh
+LESVI_TOKEN=… uv run lesvi serve     # environment (wins over everything else)
+uv run lesvi serve --token …         # flag
+# or in ~/.config/lesvi/config.toml:
+auth_token = "…"
+```
+
+With a token set, requests that did not come directly from a local process must
+authenticate:
+
+- **Browser**: visit `/login` and enter the token; lesvi sets the
+  `lesvi_session` cookie (HttpOnly, SameSite=Lax, `Secure` behind
+  `X-Forwarded-Proto: https`, 30-day HMAC-signed value) and sends you home.
+  `/logout` forgets it. Changing the token invalidates every session.
+- **Scripts**: `Authorization: Bearer <token>` works without logging in:
+  `curl -H "Authorization: Bearer $LESVI_TOKEN" https://lesvi.example.com/api/index.json`.
+- **Local**: direct loopback requests skip auth (`allow_localhost = true`,
+  default). `cloudflared` also reaches the origin over loopback, so a request
+  counts as local only when the peer is loopback **and** it carries no
+  `CF-Connecting-IP`/`X-Forwarded-For` (ADR-0008) — tunneled traffic always
+  logs in. Set `allow_localhost = false` to require a credential even locally
+  (this needs a token; `serve` refuses to start without one).
+
+Exempt paths never need auth: `/login`, `/logout`, `/healthz` (a small
+`{"ok": true, "shelves": N, "artifacts": M}` JSON), `/manifest.webmanifest`,
+`/sw.js`, `/assets/*` and `/favicon.ico`. Unauthenticated API requests get
+`401`; pages redirect to `/login`.
+
+With **no token and a non-loopback bind**, `serve` refuses to start. To accept
+that risk anyway (the library would be public), pass `--insecure`; lesvi prints
+a loud warning and says so in the banner. A loopback bind needs no token.
+
+Raw artifacts keep their byte-for-byte guarantee and run in a browser sandbox
+(opaque origin) so their JavaScript cannot read the authenticated API
+(ADR-0010). Because a sandboxed document sends no cookie on its subresources,
+dashboard cards link to **signed** artifact URLs —
+`/a/~<expiry>-<hmac>/<shelf>/<path>` — and opening an unsigned document while
+logged in redirects you to its signed form. The capability is **shelf-scoped**
+and valid for 30 days: anyone you share such a link with can read that shelf's
+artifacts and assets without logging in, so treat dashboard and
+`/api/index.json` URLs as shareable. Changing the token revokes every
+outstanding link and session at once.
 
 ## Enriching artifacts
 
@@ -160,6 +215,10 @@ instead of a `uv` cache entry that pruning can remove.
 Logs land on stderr, which systemd routes to the journal
 (`journalctl --user -u lesvi -f`). Run `serve` with `-v` for INFO (requests,
 watcher decisions) or `-vv` for DEBUG; the default is warnings only.
+
+The unit starts `lesvi serve` without your shell environment, so a token set
+only as `LESVI_TOKEN` does not reach it — put `auth_token` in the config, which
+lesvi keeps owner-only.
 
 `serve` fails fast when its port is taken, naming the port and pointing at
 `ss -tlnp | grep <port>` to find the culprit.

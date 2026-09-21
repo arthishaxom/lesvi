@@ -14,6 +14,7 @@ from lesvi.scanner import (
     HTML_READ_LIMIT,
     SIDECAR_READ_LIMIT,
     _format_mtime,  # pyright: ignore[reportPrivateUsage]
+    artifact_url,
     scan,
     scan_artifact,
     scan_shelf,
@@ -102,6 +103,19 @@ def test_scan_shelf_percent_encodes_url_paths(tmp_path: Path) -> None:
     records = scan_shelf("s", shelf, PRESET_CATEGORIES, PRESET_IGNORES)
 
     assert records[0].url == "/a/s/lessons/0003-caf%C3%A9%20notes.html"
+
+
+def test_artifact_url_inserts_a_capability_after_the_prefix() -> None:
+    assert artifact_url("s", "lessons/0001-alpha.html") == (
+        "/a/s/lessons/0001-alpha.html"
+    )
+    assert artifact_url("s", "lessons/0001-alpha.html", stamp="~99-deadbeef") == (
+        "/a/~99-deadbeef/s/lessons/0001-alpha.html"
+    )
+    # The path encoding is the same signed or not; the stamp is URL-safe.
+    assert artifact_url("s", "lessons/0003-café notes.html", stamp="~99-deadbeef") == (
+        "/a/~99-deadbeef/s/lessons/0003-caf%C3%A9%20notes.html"
+    )
 
 
 def test_scan_shelf_uses_category_and_ignore_overrides(tmp_path: Path) -> None:

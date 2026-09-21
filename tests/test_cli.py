@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from importlib.metadata import entry_points
@@ -25,6 +26,17 @@ import pytest
 
 import lesvi
 from lesvi.cli import log_level, main
+
+
+@pytest.fixture(autouse=True)
+def isolated_token_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ambient ``LESVI_TOKEN`` must not silently switch auth on in tests.
+
+    Subprocess helpers spread ``os.environ``, so a token exported in the
+    developer's shell would otherwise change every serve fixture. Tests that
+    want a token pass it explicitly.
+    """
+    monkeypatch.delenv("LESVI_TOKEN", raising=False)
 
 
 def _run_cli(
@@ -570,12 +582,14 @@ def _start_serve(
     config: Path,
     state: Path | None = None,
     *extra: str,
+    env: dict[str, str] | None = None,
 ) -> tuple[subprocess.Popen[str], list[str], str]:
     """Start ``lesvi serve`` on an ephemeral port; return (process, banner, url)."""
     environment = {
         **os.environ,
         "LESVI_CONFIG": str(tmp_path / "unused-config.toml"),
         "LESVI_STATE": str(state if state is not None else tmp_path / "state.json"),
+        **(env or {}),
     }
     process = subprocess.Popen(
         [
@@ -968,3 +982,188 @@ def test_serve_honours_watch_false_in_the_config(tmp_path: Path) -> None:
         process.communicate(timeout=10)
 
     assert payload["shelves"]["data-engg"]["total"] == 1
+
+
+# --- auth (issue #9) ----------------------------------------------------------
+
+
+def test_serve_refuses_a_non_loopback_bind_without_a_token(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LESVI_TOKEN", raising=False)
+
+    code = main(
+        [
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "0",
+            "--config",
+            str(tmp_path / "config.toml"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "--insecure" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_serve_refuses_allow_localhost_false_without_a_token(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("allow_localhost = false\n")
+
+    code = main(["serve", "--port", "0", "--config", str(config)])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "allow_localhost" in captured.err
+    assert "token" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_serve_can_start_insecurely_with_a_loud_warning(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("")
+
+    process, lines, local_url = _start_serve(
+        tmp_path, config, None, "--host", "0.0.0.0", "--insecure"
+    )
+    try:
+        port = local_url.rsplit(":", 1)[1]
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/healthz", timeout=5
+        ) as response:
+            payload = json.load(response)
+    finally:
+        process.terminate()
+        _stdout, stderr = process.communicate(timeout=10)
+
+    assert any(re.fullmatch(r"auth:\s+OFF \(--insecure\)", line) for line in lines)
+    assert "no token" in stderr
+    assert payload["ok"] is True
+
+
+def test_serve_accepts_a_non_loopback_bind_with_a_configured_token(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('auth_token = "hunter2"\n')
+
+    process, lines, local_url = _start_serve(tmp_path, config, None, "--host", "0.0.0.0")
+    try:
+        port = local_url.rsplit(":", 1)[1]
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/healthz", timeout=5
+        ) as response:
+            payload = json.load(response)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert any(line.startswith("auth:") and "token" in line for line in lines)
+    assert payload["ok"] is True
+
+
+def test_an_environment_token_allows_a_non_loopback_bind(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("")
+
+    process, lines, local_url = _start_serve(
+        tmp_path, config, None, "--host", "0.0.0.0", env={"LESVI_TOKEN": "hunter2"}
+    )
+    try:
+        port = local_url.rsplit(":", 1)[1]
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/healthz", timeout=5
+        ) as response:
+            payload = json.load(response)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert any(line.startswith("auth:") and "token" in line for line in lines)
+    assert payload["ok"] is True
+
+
+def test_serve_requires_a_login_for_tunneled_requests(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('auth_token = "hunter2"\n')
+
+    process, _lines, local_url = _start_serve(tmp_path, config, None)
+    try:
+        port = local_url.rsplit(":", 1)[1]
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/index.json",
+            headers={"CF-Connecting-IP": "203.0.113.9"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=5)
+        authenticated = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/index.json",
+            headers={"CF-Connecting-IP": "203.0.113.9", "Authorization": "Bearer hunter2"},
+        )
+        with urllib.request.urlopen(authenticated, timeout=5) as response:
+            payload = json.load(response)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert excinfo.value.code == 401
+    assert payload["shelves"] == {}
+
+
+def test_the_token_flag_enables_auth(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("")
+
+    process, lines, local_url = _start_serve(
+        tmp_path, config, None, "--token", "hunter2"
+    )
+    try:
+        port = local_url.rsplit(":", 1)[1]
+        refused = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/index.json",
+            headers={"CF-Connecting-IP": "203.0.113.9"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(refused, timeout=5)
+        allowed = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/index.json",
+            headers={
+                "CF-Connecting-IP": "203.0.113.9",
+                "Authorization": "Bearer hunter2",
+            },
+        )
+        with urllib.request.urlopen(allowed, timeout=5) as response:
+            payload = json.load(response)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert any(line.startswith("auth:") and "token" in line for line in lines)
+    assert excinfo.value.code == 401
+    assert payload["shelves"] == {}
+
+
+def test_allow_localhost_false_requires_a_login_on_loopback(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('auth_token = "hunter2"\nallow_localhost = false\n')
+
+    process, _lines, local_url = _start_serve(tmp_path, config, None)
+    try:
+        port = local_url.rsplit(":", 1)[1]
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/api/index.json")
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=5)
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    assert excinfo.value.code == 401

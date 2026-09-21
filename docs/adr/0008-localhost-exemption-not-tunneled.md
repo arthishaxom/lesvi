@@ -17,11 +17,11 @@ A request is treated as **local** (auth-exempt) only when both hold:
 1. the TCP peer is loopback, and
 2. it carries no Cloudflare forwarding headers (`CF-Connecting-IP`, `X-Forwarded-For`).
 
-Tunneled requests must pass the token check even though their TCP peer is loopback. `/login` is the password form; the same secret is accepted as `Authorization: Bearer` for scripts.
+Tunneled requests must pass the token check even though their TCP peer is loopback. `/login` is the password form; the same secret is accepted as `Authorization: Bearer` for scripts. The one exception is a signed artifact capability (ADR-0010): a sandboxed document's subresources carry no cookie, so a valid `~…` segment authorizes that shelf's `/a/` paths without a token.
 
 ## Consequences
 
-- The fallback layer really does protect the public hostname: with Access off or the URL leaked, visitors hit the login page, not the library.
+- The fallback layer really does protect the public hostname: with Access off or the URL leaked, visitors hit the login page, not the library — unless they hold a signed artifact capability for a shelf (ADR-0010).
 - Direct local browsing is unchanged — no login for loopback requests without forwarding headers.
 - Test: with a token set, `GET /` from loopback **with** `CF-Connecting-IP` → login redirect; **without** → served.
 - Works with the existing loopback bind; no second port or interface needed.

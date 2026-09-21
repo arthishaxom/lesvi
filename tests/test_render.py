@@ -18,7 +18,13 @@ import pytest
 
 from lesvi.config import Config
 from lesvi.index import Index
-from lesvi.render import HOME_PAGE_SIZE, relative_time, render_home, render_shelf
+from lesvi.render import (
+    HOME_PAGE_SIZE,
+    relative_time,
+    render_home,
+    render_login,
+    render_shelf,
+)
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
@@ -582,3 +588,34 @@ def test_shelf_page_for_an_empty_shelf_shows_guidance(tmp_path: Path) -> None:
 
     assert page.cards == []
     assert "No visible artifacts" in render_shelf(index, "empty", now=NOW)
+
+
+# --- the login page (issue #9) ------------------------------------------------
+
+
+def test_login_renders_a_form_that_posts_the_token() -> None:
+    body = render_login()
+
+    assert 'method="post" action="/login"' in body
+    assert 'id="token"' in body
+    assert 'name="token"' in body
+    assert 'type="password"' in body
+    assert "required" in body
+    assert "not correct" not in body
+
+
+def test_login_reports_a_wrong_token_as_an_alert() -> None:
+    body = render_login(error=True)
+
+    assert 'role="alert"' in body
+    assert "not correct" in body
+
+
+def test_login_keeps_the_theme_and_reads_without_the_page_script() -> None:
+    body = render_login()
+
+    assert 'href="/assets/app.css"' in body
+    assert 'localStorage.getItem("lesvi-theme")' in body
+    assert "/assets/app.js" not in body
+    assert '<main id="main"' in body
+    assert "Skip to content" in body

@@ -16,10 +16,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 from lesvi import __version__, service
+from lesvi.auth import Auth, resolve_token
 from lesvi.config import (
     Config,
     ConfigError,
     category_counts,
+    is_loopback_host,
     matches_preset,
     resolve_path,
     shelf_categories,
@@ -33,6 +35,8 @@ from lesvi.state import PinState
 from lesvi.watch import Watcher
 
 PROG = "lesvi"
+
+log = logging.getLogger(__name__)
 
 
 def log_level(verbose: int) -> int:
@@ -237,6 +241,32 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     else:
         host = config.host()
     port = args.port if args.port is not None else config.port()
+    token = resolve_token(args.token, config)
+    allow_localhost = config.allow_localhost()
+    if token is None and not allow_localhost:
+        # Refusing beats serving: with no token there is no credential at all,
+        # so ``auth = None`` would silently keep the localhost exemption the
+        # config just asked to remove.
+        raise ConfigError(
+            "allow_localhost = false requires an access token; lesvi would "
+            "otherwise serve the library without any auth. Set LESVI_TOKEN, "
+            "pass --token, add auth_token to the config, or set "
+            "allow_localhost = true"
+        )
+    if token is None and not is_loopback_host(host) and not args.insecure:
+        raise ConfigError(
+            f"refusing to serve {host}:{port} without an access token; set "
+            "LESVI_TOKEN, pass --token, add auth_token to the config, or pass "
+            "--insecure (the library would be public)"
+        )
+    if token is None and not is_loopback_host(host):
+        log.warning(
+            "insecure: serving %s:%s with no token; anyone who can reach that "
+            "port gets the whole library",
+            host,
+            port,
+        )
+    auth = Auth(token, allow_localhost=allow_localhost) if token else None
     watch_enabled = config.watch() and not args.no_watch
     poll_interval = (
         args.poll_interval
@@ -248,7 +278,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     state = PinState.load()
     index = Index.build(config, state)
     try:
-        server = make_server(index, host, port)
+        server = make_server(index, host, port, auth=auth)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             raise ConfigError(
@@ -289,6 +319,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print("watch:     native (watchfiles)")
     else:
         print(f"watch:     polling every {poll_interval:g}s")
+    if auth is not None:
+        print("auth:      token (/login; Bearer accepted)")
+    elif is_loopback_host(host):
+        print("auth:      off (loopback bind)")
+    else:
+        print("auth:      OFF (--insecure)")
     print(f"local:     http://{bound_host}:{bound_port}")
     public_url = config.public_url()
     if public_url:
@@ -398,7 +434,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=_port, help="listen port, 0-65535 (default 8787)"
     )
     serve_parser.add_argument("--host", help="bind address (default 127.0.0.1)")
-    serve_parser.add_argument("--config", help="config file (default $LESVI_CONFIG)")
+    serve_parser.add_argument(
+        "--config", help="config file (default $LESVI_CONFIG)"
+    )
+    serve_parser.add_argument(
+        "--token",
+        help="fallback access token; $LESVI_TOKEN wins, auth_token is the fallback",
+    )
+    serve_parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="serve a non-loopback bind without a token (auth off; loud warning)",
+    )
     serve_parser.add_argument(
         "--no-watch",
         action="store_true",

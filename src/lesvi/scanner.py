@@ -77,6 +77,19 @@ class Artifact:
         return record
 
 
+def artifact_url(shelf: str, relative: str, *, stamp: str | None = None) -> str:
+    """The public URL for a shelf-relative artifact.
+
+    Without *stamp* this is the stable ``/a/<shelf>/<path>`` address; with one
+    (a capability segment from :meth:`lesvi.auth.Auth.artifact_stamp`) the
+    segment goes right after ``/a/`` so the artifact's relative subresources
+    inherit it. Both spellings percent-encode the path identically, so they
+    address the same bytes.
+    """
+    base = f"/a/{stamp}/" if stamp else "/a/"
+    return base + quote(f"{shelf}/{relative}", safe="/")
+
+
 def scan_shelf(
     name: str,
     root: Path,
@@ -241,7 +254,7 @@ def _artifact(
             log.debug("skipping artifact outside the shelf root: %s", path)
             return None
     try:
-        url = "/a/" + quote(f"{name}/{relative}", safe="/")
+        url = artifact_url(name, relative)
     except UnicodeEncodeError:
         log.debug("skipping artifact with a non-UTF-8 name: %r", relative)
         return None

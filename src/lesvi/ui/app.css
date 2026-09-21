@@ -438,6 +438,70 @@ code {
   font-size: 0.9em;
 }
 
+/* Login (auth fallback, ADR-0004) */
+
+.login {
+  max-width: 24rem;
+  padding-top: 3rem;
+}
+
+.login-title {
+  margin: 0 0 0.25rem;
+  font-size: 1.75rem;
+  letter-spacing: -0.01em;
+}
+
+.login-lede {
+  margin: 0 0 1.5rem;
+  color: var(--muted);
+}
+
+.login-error {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--focus);
+  border-radius: 0.5rem;
+  color: var(--ink);
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.login-label {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.login-input {
+  min-height: 44px;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+}
+
+.login-button {
+  min-height: 44px;
+  margin-top: 0.25rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -13,6 +13,7 @@ import pytest
 
 from lesvi.config import Config
 from lesvi.index import Index
+from lesvi.scanner import Artifact
 from lesvi.state import PinState
 
 
@@ -562,3 +563,50 @@ def test_changed_is_fast_at_five_thousand_artifacts(tmp_path: Path) -> None:
 
     assert len(changed.artifacts) == 5000
     assert elapsed < 0.05, f"incremental update took {elapsed * 1000:.1f} ms"
+
+
+# --- signed artifact URLs (issue #9) ------------------------------------------
+
+
+def _stamped_url(artifact: Artifact) -> str:
+    """A stand-in for the server's signing callback."""
+    return f"/a/~stamp-{artifact.shelf}/{artifact.shelf}/{artifact.path}"
+
+
+def test_with_urls_rewrites_every_view_and_the_json_payload(tmp_path: Path) -> None:
+    shelf = tmp_path / "data-engg"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    _write(shelf, "lessons/0002-beta.html", "<p>b</p>")
+    _write(shelf, "reference/cheatsheet.html", "<p>c</p>")
+    index = Index.build(_shelf_config(tmp_path, **{"data-engg": shelf}))
+
+    signed = index.with_urls(_stamped_url)
+
+    assert [artifact.path for artifact in signed.by_number("data-engg")] == [
+        "lessons/0001-alpha.html",
+        "lessons/0002-beta.html",
+        "reference/cheatsheet.html",
+    ]
+    assert [artifact.path for artifact in signed.by_recency("data-engg")] == [
+        artifact.path for artifact in index.by_recency("data-engg")
+    ]
+    assert all(
+        artifact.url.startswith("/a/~stamp-")
+        for artifact in signed.by_recency("data-engg")
+    )
+    assert len(signed.artifacts) == len(index.artifacts)
+    assert all(artifact.url.startswith("/a/~stamp-") for artifact in signed.artifacts)
+    assert all(
+        record["url"].startswith("/a/~stamp-") for record in signed.to_json()["artifacts"]
+    )
+    # The original snapshot is untouched (it is shared with the watcher).
+    assert all(not artifact.url.startswith("/a/~stamp-") for artifact in index.artifacts)
+
+
+def test_with_urls_returns_itself_when_no_url_would_change(tmp_path: Path) -> None:
+    shelf = tmp_path / "shelf"
+    _write(shelf, "lessons/0001-alpha.html", "<p>a</p>")
+    state = PinState.load(tmp_path / "state.json")
+    index = Index.build(_shelf_config(tmp_path, shelf=shelf), state)
+
+    assert index.with_urls(lambda artifact: artifact.url) is index

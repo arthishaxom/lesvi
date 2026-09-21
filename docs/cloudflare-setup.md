@@ -38,7 +38,7 @@ Free tier: Access is free for teams under 50 users; one human = one seat. Servic
 ## 3. Optional hardening
 
 - In the tunnel's public-hostname settings, enable **Protect with Access** so `cloudflared` validates the Access JWT before the request reaches lesvi.
-- Add lesvi's own `auth_token` in `~/.config/lesvi/config.toml` as defense in depth (`LESVI_TOKEN` env also works); localhost stays exempt.
+- Add lesvi's own `auth_token` in `~/.config/lesvi/config.toml` as defense in depth; `LESVI_TOKEN` (env, wins) and `--token` also work. Direct local browsing stays exempt; tunneled traffic logs in once at `/login`, and the same token works as `Authorization: Bearer` for scripts. `serve` refuses a non-loopback bind with no token unless you pass `--insecure`.
 - Restrict the Access policy further with **Require** → **Country** or device posture if you want.
 
 ## 4. Phone

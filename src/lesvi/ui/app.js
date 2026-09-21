@@ -199,6 +199,10 @@
             pinned: next,
           }),
         });
+        if (response.status === 401) {
+          window.location.assign("/login"); // the session expired mid-page
+          return;
+        }
         if (!response.ok) throw new Error(`pin failed: ${response.status}`);
         announce(`${next ? "Pinned" : "Unpinned"} ${title}`);
       } catch (error) {
